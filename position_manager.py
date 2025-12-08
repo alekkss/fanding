@@ -235,24 +235,24 @@ class MultiPositionManager:
             return len(self.positions)
     
     def close_position_with_pnl(
-        self,
-        crypto: str,
-        close_spot_price: float,
-        close_futures_price: float
-    ) -> Optional[dict]:
+    self,
+    crypto: str,
+    close_spot_price: float,
+    close_futures_price: float
+) -> Optional[dict]:
         """
-        Закрывает позицию, считает PnL и сохраняет в историю.
-        Использует PnLCalculator для расчетов.
+        Закрывает позицию, считает PnL с учетом РЕАЛЬНОГО фандинга и сохраняет в историю.
         """
         with self.lock:
             if crypto not in self.positions:
                 logger.error(f"Позиция {crypto} не найдена для закрытия")
                 return None
-
+            
             position = self.positions[crypto]
             
-            # 1. Импорты внутри метода (чтобы избежать циклических зависимостей)
+            # 1. Импорты
             from pnl_calculator import PnLCalculator
+            from funding_calculator import RealizedFundingCalculator
             from config import COMMISSION_PCT
             
             # 2. Подготовка данных
@@ -261,31 +261,41 @@ class MultiPositionManager:
             
             # Размер позиции в USDT (среднее)
             position_size = (
-                (position["spot_qty"] * position["spot_entry_price"]) + 
+                (position["spot_qty"] * position["spot_entry_price"]) +
                 (position["futures_qty"] * position["futures_entry_price"])
             ) / 2
-
+            
             # Комиссия: 0.2% -> 0.002
             commission_rate = COMMISSION_PCT / 100.0
             
-            # Накопленный фандинг (если он есть в данных позиции, иначе 0)
-            # В твоем коде я не вижу поля total_funding, но возможно оно там появится
-            # или мы можем передать 0, если пока не считаем накопление
-            total_funding = position.get("total_funding", 0.0)
-
-            # 3. Вызов калькулятора (stateless)
+            # 3. 🆕 РАСЧЕТ РЕАЛЬНОГО ФАНДИНГА через API
+            entry_timestamp = position.get("entry_timestamp")
+            logger.info(f"[{crypto}] 💰 Рассчитываем накопленный фандинг с момента открытия...")
+            
+            try:
+                accumulated_funding = RealizedFundingCalculator.get_accumulated_funding(
+                    crypto=crypto,
+                    start_time_iso=entry_timestamp,
+                    end_time_iso=None  # До текущего момента
+                )
+                logger.info(f"[{crypto}] ✅ Накопленный фандинг: {accumulated_funding:.4f} USDT")
+            except Exception as e:
+                logger.error(f"[{crypto}] ❌ Ошибка расчета фандинга: {e}")
+                accumulated_funding = 0.0
+            
+            # 4. Вызов калькулятора PnL
             pnl_result = PnLCalculator.calculate_pnl(
                 entry_price=avg_entry_price,
                 exit_price=avg_exit_price,
                 position_size=position_size,
                 commission_rate=commission_rate,
-                total_funding_received=total_funding
+                total_funding_received=accumulated_funding  # 🆕 Реальные данные!
             )
-
-            # 4. Формирование записи для истории
+            
+            # 5. Формирование записи для истории
             closed_position = {
                 "crypto": crypto,
-                "entry_time": position.get("entry_timestamp"),
+                "entry_time": entry_timestamp,
                 "close_time": datetime.now().isoformat(),
                 "spot_entry_price": position["spot_entry_price"],
                 "futures_entry_price": position["futures_entry_price"],
@@ -295,23 +305,27 @@ class MultiPositionManager:
                 "futures_qty": position["futures_qty"],
                 "position_size_usdt": position_size,
                 "entry_spread_pct": position.get("entry_spread_pct", 0),
-                # Считаем спред выхода для статистики
                 "close_spread_pct": (close_futures_price - close_spot_price) / close_spot_price * 100,
+                "funding_payments_count": position.get("funding_payments_count", 0),
+                "accumulated_funding": accumulated_funding,  # 🆕 Сохраняем фандинг
                 "pnl": pnl_result
             }
-
-            # 5. Сохранение и очистка
+            
+            # 6. Сохранение и очистка
             self._save_closed_position(closed_position)
             
+            # 🆕 Улучшенный лог с деталями
             logger.info(
-                f"💰 Закрыта позиция {crypto}. "
-                f"Net PnL: {pnl_result['net_pnl']} USDT "
-                f"(Price: {pnl_result['price_pnl']}, Funding: {pnl_result['funding']})"
+                f"💰 Закрыта позиция {crypto}:\n"
+                f"   ├─ Price PnL:    {pnl_result['price_pnl']:+.4f} USDT\n"
+                f"   ├─ Funding:      {pnl_result['funding']:+.4f} USDT ({position.get('funding_payments_count', 0)} выплат)\n"
+                f"   ├─ Commission:   {pnl_result['commission']:.4f} USDT\n"
+                f"   └─ Net PnL:      {pnl_result['net_pnl']:+.4f} USDT"
             )
-
+            
             # Удаляем открытую позицию (и файл json)
             self.clear_position(crypto)
-
+            
             return pnl_result
 
     def _save_closed_position(self, closed_position: dict) -> None:
