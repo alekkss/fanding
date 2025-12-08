@@ -1,0 +1,285 @@
+# -*- coding: utf-8 -*-
+
+"""Оркестратор с поддержкой множественных позиций"""
+
+import logging
+import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Set
+
+from position_manager import MultiPositionManager
+from price_service import PriceFetcher
+from spread_analyzer import SpreadAnalyzer
+from funding_rate_service import FundingRateFetcher
+from arbitrage_calculator import ArbitrageCalculator
+from opportunity_monitor import OpportunityMonitor
+from blacklist_manager import blacklist_manager
+from logger_config import setup_logging
+from config import (
+    MIN_SPREAD_PCT, MAX_CONCURRENT_POSITIONS, 
+    MAX_TRADING_THREADS, SCAN_INTERVAL_SEC
+)
+
+logger = setup_logging()
+
+
+class MultiCryptoOrchestrator:
+    """Оркестратор для торговли несколькими криптовалютами одновременно"""
+    
+    def __init__(self):
+        self.position_manager = MultiPositionManager()
+        self.active_threads: Set[str] = set()
+        self.lock = threading.Lock()
+        self.shutdown_event = threading.Event()
+    
+    def monitor_position(self, crypto: str) -> None:
+        """Мониторит открытую позицию в отдельном потоке"""
+        try:
+            logger.info(f"[{crypto}] 🔍 Начат мониторинг позиции")
+            
+            while not self.shutdown_event.is_set():
+                position = self.position_manager.get_position(crypto)
+                
+                if not position:
+                    logger.warning(f"[{crypto}] Позиция исчезла, завершаем мониторинг")
+                    break
+                
+                success = OpportunityMonitor.monitor_open_position_single(
+                    position, crypto, self.position_manager
+                )
+                
+                if success:
+                    logger.info(f"[{crypto}] ✅ Позиция закрыта успешно")
+                    break
+                
+                time.sleep(5)
+            
+        except Exception as e:
+            logger.error(f"[{crypto}] ❌ Ошибка мониторинга: {e}")
+        finally:
+            with self.lock:
+                self.active_threads.discard(crypto)
+            logger.info(f"[{crypto}] 🛑 Мониторинг завершен")
+    
+    def try_open_position(self, crypto: str, opportunity_data: dict) -> bool:
+        """Пытается открыть позицию для криптовалюты"""
+        try:
+            logger.info(f"[{crypto}] 🎯 Попытка открыть позицию")
+            
+            success = OpportunityMonitor.monitor_and_execute(
+                crypto, opportunity_data, self.position_manager
+            )
+            
+            if success:
+                logger.info(f"[{crypto}] ✅ Позиция успешно открыта")
+                
+                monitor_thread = threading.Thread(
+                    target=self.monitor_position,
+                    args=(crypto,),
+                    name=f"Monitor-{crypto}",
+                    daemon=True
+                )
+                monitor_thread.start()
+                
+                return True
+            else:
+                logger.warning(f"[{crypto}] ⚠️ Не удалось открыть позицию")
+                return False
+                
+        except Exception as e:
+            logger.error(f"[{crypto}] ❌ Ошибка открытия позиции: {e}")
+            return False
+        finally:
+            with self.lock:
+                self.active_threads.discard(f"open_{crypto}")
+    
+    def restore_monitoring(self) -> None:
+        """
+        НОВАЯ ФУНКЦИЯ: Восстанавливает мониторинг для существующих позиций
+        Вызывается при старте программы
+        """
+        open_positions = self.position_manager.get_open_cryptos()
+        
+        if not open_positions:
+            logger.info("📍 Нет открытых позиций для восстановления")
+            return
+        
+        logger.info(f"🔄 Восстановление мониторинга для {len(open_positions)} позиций...")
+        
+        for crypto in open_positions:
+            position = self.position_manager.get_position(crypto)
+            
+            if not position:
+                logger.warning(f"[{crypto}] Позиция в списке, но не найдена в менеджере")
+                continue
+            
+            logger.info(f"[{crypto}] 🔄 Восстановление мониторинга...")
+            logger.info(f"[{crypto}]    Вход: Спот={position['spot_entry_price']:.6f}, "
+                       f"Фьюч={position['futures_entry_price']:.6f}")
+            logger.info(f"[{crypto}]    Qty: Спот={position['spot_qty']:.4f}, "
+                       f"Фьюч={position['futures_qty']:.4f}")
+            
+            # Добавляем в активные потоки
+            with self.lock:
+                self.active_threads.add(crypto)
+            
+            # Запускаем поток мониторинга
+            monitor_thread = threading.Thread(
+                target=self.monitor_position,
+                args=(crypto,),
+                name=f"Monitor-{crypto}",
+                daemon=True
+            )
+            monitor_thread.start()
+            
+            logger.info(f"[{crypto}] ✅ Мониторинг восстановлен")
+        
+        logger.info(f"✅ Мониторинг восстановлен для {len(open_positions)} позиций")
+    
+    def scan_opportunities(self) -> None:
+        """Сканирует рынок на возможности и открывает позиции"""
+        try:
+            # ✅ НОВОЕ: Импорт blacklist_manager
+            from blacklist_manager import blacklist_manager
+            
+            open_positions = self.position_manager.get_open_cryptos()
+            open_count = len(open_positions)
+            
+            logger.info(f"📊 Открытых позиций: {open_count}/{MAX_CONCURRENT_POSITIONS}")
+            
+            if open_count >= MAX_CONCURRENT_POSITIONS:
+                logger.info(f"⏸️ Достигнут лимит позиций ({MAX_CONCURRENT_POSITIONS}), ждем закрытия")
+                return
+            
+            symbols = PriceFetcher.get_all_symbols()
+            if not symbols:
+                logger.error("Не удалось получить символы")
+                return
+            
+            # ✅ НОВОЕ: Фильтруем blacklist
+            blacklisted = blacklist_manager.get_blacklist()
+            symbols_before = len(symbols)
+            symbols = [s for s in symbols if s not in blacklisted]
+            
+            if blacklisted:
+                filtered_count = symbols_before - len(symbols)
+                if filtered_count > 0:
+                    logger.info(f"🚫 Исключено из blacklist: {filtered_count} пар ({', '.join(sorted(blacklisted))})")
+            
+            available_symbols = [s for s in symbols if s not in open_positions]
+            
+            logger.info(f"📈 Доступно для торговли: {len(available_symbols)} пар")
+            
+            if not available_symbols:
+                logger.info("Все доступные пары уже в торговле или в blacklist")
+                return
+            
+            orderbooks = PriceFetcher.get_orderbook_batch(available_symbols)
+            if not orderbooks:
+                logger.error("Не удалось получить orderbook")
+                return
+            
+            filtered_pairs = SpreadAnalyzer.filter_and_display(orderbooks)
+            if not filtered_pairs:
+                logger.info(f"Нет пар с спредом >= {MIN_SPREAD_PCT}%")
+                return
+            
+            crypto_list = [p['crypto'] for p in filtered_pairs]
+            funding_rates = FundingRateFetcher.get_batch_funding_rates(crypto_list)
+            
+            opportunities = ArbitrageCalculator.find_top_opportunities(
+                filtered_pairs, funding_rates,
+                limit=MAX_CONCURRENT_POSITIONS - open_count
+            )
+            
+            if not opportunities:
+                logger.info("Нет прибыльных возможностей")
+                return
+            
+            for opp in opportunities:
+                crypto = opp['crypto']
+                
+                # ✅ НОВОЕ: Дополнительная проверка blacklist перед открытием позиции
+                if blacklist_manager.is_blacklisted(crypto):
+                    logger.warning(f"[{crypto}] 🚫 В blacklist, пропускаем")
+                    continue
+                
+                with self.lock:
+                    if self.position_manager.has_position(crypto):
+                        continue
+                    
+                    if self.position_manager.get_positions_count() >= MAX_CONCURRENT_POSITIONS:
+                        break
+                    
+                    self.active_threads.add(f"open_{crypto}")
+                
+                open_thread = threading.Thread(
+                    target=self.try_open_position,
+                    args=(crypto, opp),
+                    name=f"Open-{crypto}",
+                    daemon=True
+                )
+                open_thread.start()
+                logger.info(f"[{crypto}] 🚀 Запущен поток открытия позиции")
+                time.sleep(1)
+        
+        except Exception as e:
+            logger.error(f"❌ Ошибка сканирования: {e}")
+    
+    def run(self) -> None:
+        """Главный цикл оркестратора"""
+        logger.info("="*60)
+        logger.info("🚀 START MULTI-CRYPTO ARBITRAGE TRADER v3.0")
+        logger.info(f"📊 Макс. одновременных позиций: {MAX_CONCURRENT_POSITIONS}")
+        logger.info(f"⏱️ Интервал сканирования: {SCAN_INTERVAL_SEC}s")
+        logger.info("="*60)
+        
+        # ✅ НОВОЕ: Восстанавливаем мониторинг существующих позиций
+        self.restore_monitoring()
+        
+        try:
+            while not self.shutdown_event.is_set():
+                try:
+                    self.scan_opportunities()
+                    
+                    logger.info(f"⏸️ Ожидание {SCAN_INTERVAL_SEC}s до следующего сканирования...")
+                    time.sleep(SCAN_INTERVAL_SEC)
+                
+                except KeyboardInterrupt:
+                    logger.info("👋 Получен сигнал остановки (Ctrl+C)")
+                    self.shutdown()
+                    break
+                
+                except Exception as e:
+                    logger.error(f"❌ Ошибка в главном цикле: {e}")
+                    time.sleep(30)
+        
+        finally:
+            logger.info("🛑 Оркестратор остановлен")
+    
+    def shutdown(self) -> None:
+        """Корректная остановка всех потоков"""
+        logger.info("🛑 Инициирована остановка...")
+        self.shutdown_event.set()
+        
+        for i in range(30):
+            with self.lock:
+                active_count = len(self.active_threads)
+            
+            if active_count == 0:
+                break
+            
+            logger.info(f"⏳ Ожидание завершения {active_count} потоков...")
+            time.sleep(1)
+        
+        logger.info("✅ Все потоки завершены")
+
+
+def main():
+    orchestrator = MultiCryptoOrchestrator()
+    orchestrator.run()
+
+
+if __name__ == "__main__":
+    main()
