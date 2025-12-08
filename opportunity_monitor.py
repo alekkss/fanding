@@ -33,97 +33,88 @@ class OpportunityMonitor:
         РЕЖИМЫ ЗАКРЫТИЯ:
         - ОБЫЧНЫЙ: FR < -0.001% И спред закрытия <= 0.5%
         - МЯГКИЙ: FR <= 0.005% И спред закрытия <= 0.5%
-        * Активируется после 2+ раундов с FR <= 0.005%
-        
-        Args:
-            position: dict с данными позиции
-            crypto: символ криптовалюты
-            position_manager: экземпляр MultiPositionManager
-        
-        Returns:
-            bool: True если позиция закрыта, False если мониторинг продолжается
+          * Активируется после 2+ раундов с FR <= 0.005%
         """
         from config import (
             CLOSE_FR_THRESHOLD, MONITOR_INTERVAL_SEC, MAX_CLOSE_SPREAD_PCT,
             LOW_FR_TRACKING_THRESHOLD, MIN_FUNDING_PAYMENTS_FOR_CLOSE
         )
-        
+
         entry_spread = position['entry_spread_pct']
         entry_spot_price = position['spot_entry_price']
         entry_futures_price = position['futures_entry_price']
-        
+
         logger.info(f"[{crypto}] 🔍 Мониторинг закрытия...")
         logger.info(f"[{crypto}] └─ Входные цены: Спот={entry_spot_price:.6f}, Фьюч={entry_futures_price:.6f}")
         logger.info(f"[{crypto}] └─ Входной спред: {entry_spread:.4f}%")
-        
+
         # Пауза 10 секунд после открытия позиции перед первой проверкой
         logger.info(f"[{crypto}] ⏸️ Пауза 10 секунд после открытия позиции...")
         time.sleep(10)
-        
+
         attempts = 0
         max_attempts = 1000
-        
+
         while attempts < max_attempts:
             attempts += 1
-            
+
             # Проверяем что позиция еще существует
             current_position = position_manager.get_position(crypto)
             if not current_position:
                 logger.warning(f"[{crypto}] Позиция исчезла, завершаем мониторинг")
                 return False
-            
+
             # Получаем текущий funding rate
             funding_rate = FundingRateFetcher.get_single_funding_rate(crypto)
             if funding_rate is None:
                 logger.warning(f"[{crypto}] Не удалось получить FR, повтор через 60 сек")
                 time.sleep(60)
                 continue
-            
-            # ✅ НОВОЕ: Отслеживаем низкий FR для активации мягкого режима
+
+            # Отслеживаем низкий FR для активации мягкого режима
             position_manager.increment_funding_count(crypto, funding_rate)
             current_position = position_manager.get_position(crypto)  # обновляем данные позиции
-            
+
             # Получаем orderbook для расчета спреда закрытия
             spot_ob = PriceFetcher.get_orderbook(crypto, "spot")
             fut_ob = PriceFetcher.get_orderbook(crypto, "linear")
-            
+
             if not spot_ob or not fut_ob:
                 logger.warning(f"[{crypto}] Не удалось получить orderbook, повтор через 60 сек")
                 time.sleep(60)
                 continue
-            
+
             spot_bid = spot_ob.get('bid')
             fut_ask = fut_ob.get('ask')
-            
+
             if not spot_bid or not fut_ask:
                 logger.warning(f"[{crypto}] Нет BID/ASK, повтор через 60 сек")
                 time.sleep(60)
                 continue
-            
+
             # Спред для ЗАКРЫТИЯ позиции (fut_ask - spot_bid)
+            # Мы продаем спот (bid) и покупаем фьюч (ask) для закрытия
             current_close_spread = (fut_ask - spot_bid) / spot_bid * 100
-            
+
             logger.info(f"[{crypto}] [{attempts}/{max_attempts}] FR: {funding_rate:.4f}%, "
-                    f"Спред закрытия: {current_close_spread:.4f}%")
-            
-            # ✅ НОВАЯ ЛОГИКА: Проверяем мягкий режим
+                        f"Спред закрытия: {current_close_spread:.4f}%")
+
+            # Проверяем мягкий режим
             soft_mode_active = current_position.get('consecutive_low_fr', False)
             low_fr_count = current_position.get('low_fr_count', 0)
-            
+
             if soft_mode_active:
                 logger.info(f"[{crypto}] 🟡 МЯГКИЙ РЕЖИМ АКТИВЕН (FR был низким {low_fr_count} раундов)")
                 logger.info(f"[{crypto}] └─ Условие: FR <= {LOW_FR_TRACKING_THRESHOLD}% И Спред <= {MAX_CLOSE_SPREAD_PCT}%")
             else:
                 logger.info(f"[{crypto}] └─ Условия: FR < {CLOSE_FR_THRESHOLD}% И Спред <= {MAX_CLOSE_SPREAD_PCT}%")
-            
-            # Определяем условия закрытия в зависимости от режима
+
+            # Определяем условия закрытия
             if soft_mode_active:
-                # МЯГКИЙ РЕЖИМ: закрываем если FR <= 0.005% И спред <= 0.5%
                 should_close = funding_rate <= LOW_FR_TRACKING_THRESHOLD and current_close_spread <= MAX_CLOSE_SPREAD_PCT
             else:
-                # ОБЫЧНЫЙ РЕЖИМ: FR < -0.001% И спред <= 0.5%
                 should_close = funding_rate < CLOSE_FR_THRESHOLD and current_close_spread <= MAX_CLOSE_SPREAD_PCT
-            
+
             if should_close:
                 if soft_mode_active:
                     logger.info(f"[{crypto}] 🔥 Условия закрытия (МЯГКИЙ РЕЖИМ):")
@@ -133,24 +124,33 @@ class OpportunityMonitor:
                     logger.info(f"[{crypto}] 🔥 Условия закрытия выполнены:")
                     logger.info(f"[{crypto}] └─ FR {funding_rate:.4f}% < {CLOSE_FR_THRESHOLD}% ✅")
                     logger.info(f"[{crypto}] └─ Спред {current_close_spread:.4f}% <= {MAX_CLOSE_SPREAD_PCT}% ✅")
-                
+
                 # Обновляем позицию из менеджера
                 fresh_position = position_manager.get_position(crypto)
                 if not fresh_position:
                     logger.error(f"[{crypto}] Позиция исчезла перед закрытием")
                     return False
-                
-                # Закрываем позицию
+
+                # Закрываем позицию физически (на бирже)
                 success = PositionCloser.close_position(fresh_position, crypto, position_manager)
+
                 if success:
-                    position_manager.clear_position(crypto)
-                    logger.info(f"[{crypto}] ✅ Позиция успешно закрыта")
+                    # ✅ ИЗМЕНЕНИЕ: Теперь рассчитываем PnL и сохраняем историю
+                    # Передаем текущие цены (spot_bid, fut_ask), которые мы проверили выше
+                    position_manager.close_position_with_pnl(
+                        crypto=crypto,
+                        close_spot_price=spot_bid,
+                        close_futures_price=fut_ask
+                    )
+                    
+                    logger.info(f"[{crypto}] ✅ Позиция успешно закрыта, PnL сохранен")
                     return True
                 else:
-                    logger.error(f"[{crypto}] Ошибка закрытия позиции, повтор через 5 минут")
+                    logger.error(f"[{crypto}] Ошибка закрытия позиции, повтор через {MONITOR_INTERVAL_SEC} сек")
                     time.sleep(MONITOR_INTERVAL_SEC)
+
             else:
-                # Логируем какое условие не выполнено
+                # Логируем, какое условие не выполнено
                 if soft_mode_active:
                     if funding_rate > LOW_FR_TRACKING_THRESHOLD:
                         logger.debug(f"[{crypto}] FR {funding_rate:.4f}% > {LOW_FR_TRACKING_THRESHOLD}%, ждем снижения FR")
@@ -161,9 +161,9 @@ class OpportunityMonitor:
                         logger.debug(f"[{crypto}] FR {funding_rate:.4f}% >= {CLOSE_FR_THRESHOLD}%, ждем снижения FR")
                     if current_close_spread > MAX_CLOSE_SPREAD_PCT:
                         logger.debug(f"[{crypto}] Спред {current_close_spread:.4f}% > {MAX_CLOSE_SPREAD_PCT}%, ждем сужения спреда")
-                
-                time.sleep(MONITOR_INTERVAL_SEC)  # 300 секунд = 5 минут
-        
+
+                time.sleep(MONITOR_INTERVAL_SEC)
+
         logger.warning(f"[{crypto}] ⏱️ Время мониторинга истекло ({max_attempts} попыток)")
         return False
     

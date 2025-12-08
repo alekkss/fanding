@@ -233,3 +233,100 @@ class MultiPositionManager:
         """Возвращает количество открытых позиций"""
         with self.lock:
             return len(self.positions)
+    
+    def close_position_with_pnl(
+        self,
+        crypto: str,
+        close_spot_price: float,
+        close_futures_price: float
+    ) -> Optional[dict]:
+        """
+        Закрывает позицию, считает PnL и сохраняет в историю.
+        Использует PnLCalculator для расчетов.
+        """
+        with self.lock:
+            if crypto not in self.positions:
+                logger.error(f"Позиция {crypto} не найдена для закрытия")
+                return None
+
+            position = self.positions[crypto]
+            
+            # 1. Импорты внутри метода (чтобы избежать циклических зависимостей)
+            from pnl_calculator import PnLCalculator
+            from config import COMMISSION_PCT
+            
+            # 2. Подготовка данных
+            avg_entry_price = (position["spot_entry_price"] + position["futures_entry_price"]) / 2
+            avg_exit_price = (close_spot_price + close_futures_price) / 2
+            
+            # Размер позиции в USDT (среднее)
+            position_size = (
+                (position["spot_qty"] * position["spot_entry_price"]) + 
+                (position["futures_qty"] * position["futures_entry_price"])
+            ) / 2
+
+            # Комиссия: 0.2% -> 0.002
+            commission_rate = COMMISSION_PCT / 100.0
+            
+            # Накопленный фандинг (если он есть в данных позиции, иначе 0)
+            # В твоем коде я не вижу поля total_funding, но возможно оно там появится
+            # или мы можем передать 0, если пока не считаем накопление
+            total_funding = position.get("total_funding", 0.0)
+
+            # 3. Вызов калькулятора (stateless)
+            pnl_result = PnLCalculator.calculate_pnl(
+                entry_price=avg_entry_price,
+                exit_price=avg_exit_price,
+                position_size=position_size,
+                commission_rate=commission_rate,
+                total_funding_received=total_funding
+            )
+
+            # 4. Формирование записи для истории
+            closed_position = {
+                "crypto": crypto,
+                "entry_time": position.get("entry_timestamp"),
+                "close_time": datetime.now().isoformat(),
+                "spot_entry_price": position["spot_entry_price"],
+                "futures_entry_price": position["futures_entry_price"],
+                "spot_close_price": close_spot_price,
+                "futures_close_price": close_futures_price,
+                "spot_qty": position["spot_qty"],
+                "futures_qty": position["futures_qty"],
+                "position_size_usdt": position_size,
+                "entry_spread_pct": position.get("entry_spread_pct", 0),
+                # Считаем спред выхода для статистики
+                "close_spread_pct": (close_futures_price - close_spot_price) / close_spot_price * 100,
+                "pnl": pnl_result
+            }
+
+            # 5. Сохранение и очистка
+            self._save_closed_position(closed_position)
+            
+            logger.info(
+                f"💰 Закрыта позиция {crypto}. "
+                f"Net PnL: {pnl_result['net_pnl']} USDT "
+                f"(Price: {pnl_result['price_pnl']}, Funding: {pnl_result['funding']})"
+            )
+
+            # Удаляем открытую позицию (и файл json)
+            self.clear_position(crypto)
+
+            return pnl_result
+
+    def _save_closed_position(self, closed_position: dict) -> None:
+        """Сохраняет закрытую позицию в общий файл истории (append)"""
+        history_file = os.path.join(self.positions_dir, "closed_positions_history.json")
+        try:
+            history = []
+            if os.path.exists(history_file):
+                with open(history_file, "r", encoding="utf-8") as f:
+                    history = json.load(f)
+            
+            history.append(closed_position)
+            
+            with open(history_file, "w", encoding="utf-8") as f:
+                json.dump(history, f, indent=2, ensure_ascii=False)
+                
+        except Exception as e:
+            logger.error(f"Ошибка сохранения истории позиций: {e}")
