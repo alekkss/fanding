@@ -7,7 +7,6 @@ class PnLCalculator:
     """
     Калькулятор прибыли/убытка для арбитражных сделок.
     Стратегия: Long Spot + Short Futures
-    Статический класс без состояния.
     """
     
     @staticmethod
@@ -23,64 +22,41 @@ class PnLCalculator:
     ) -> Dict[str, float]:
         """
         Рассчитывает чистую прибыль/убыток по арбитражной сделке.
-        
-        Args:
-            spot_entry_price: Цена покупки спота
-            spot_exit_price: Цена продажи спота
-            futures_entry_price: Цена открытия шорта на фьючерсе
-            futures_exit_price: Цена закрытия шорта на фьючерсе
-            spot_qty: Количество монет на споте
-            futures_qty: Количество монет на фьючерсе
-            commission_rate: Ставка комиссии (например, 0.002 для 0.2%)
-            total_funding_received: Накопленный фандинг (+ прибыль / - убыток)
-        
-        Returns:
-            dict: {
-                "net_pnl": Чистая прибыль/убыток,
-                "price_pnl": PnL от изменения цен,
-                "spot_pnl": PnL только от спота,
-                "futures_pnl": PnL только от фьючерса,
-                "commission": Общая комиссия,
-                "funding": Фандинг
-            }
         """
         
         # 1. PnL от СПОТА (Long позиция)
-        # Купили дешево → Продали дорого = Прибыль
-        # Формула: (Цена продажи - Цена покупки) * Количество
         spot_pnl = (spot_exit_price - spot_entry_price) * spot_qty
         
         # 2. PnL от ФЬЮЧЕРСА (Short позиция)
-        # Продали дорого → Купили дешево = Прибыль
-        # ВАЖНО: Для шорта инвертируем формулу!
-        # Формула: (Цена открытия - Цена закрытия) * Количество
         futures_pnl = (futures_entry_price - futures_exit_price) * futures_qty
         
         # 3. Общий Price PnL
         price_pnl = spot_pnl + futures_pnl
         
-        # 4. Комиссия
-        # Считаем объем в USDT для всех операций:
-        # - Вход: покупка спота + продажа фьючерса
-        # - Выход: продажа спота + покупка фьючерса
-        
-        # Объем входа
+        # 4. 🆕 ПРАВИЛЬНЫЙ РАСЧЕТ КОМИССИИ
+        # Считаем среднюю позицию (так как спот и фьючерс это одна позиция)
         spot_entry_volume = spot_qty * spot_entry_price
         futures_entry_volume = futures_qty * futures_entry_price
+        average_position_size = (spot_entry_volume + futures_entry_volume) / 2
         
-        # Объем выхода
-        spot_exit_volume = spot_qty * spot_exit_price
-        futures_exit_volume = futures_qty * futures_exit_price
+        # Комиссия за круг (вход + выход)
+        # Множитель 2: одна операция на открытие, одна на закрытие
+        commission = average_position_size * 2 * commission_rate
         
-        # Общий объем всех операций
-        total_volume = (spot_entry_volume + futures_entry_volume + 
-                       spot_exit_volume + futures_exit_volume)
-        
-        # Комиссия = Общий объем * Ставка
-        commission = total_volume * commission_rate
+        # Альтернативный метод (более точный при изменении цены):
+        # spot_exit_volume = spot_qty * spot_exit_price
+        # futures_exit_volume = futures_qty * futures_exit_price
+        # 
+        # Комиссия от спота
+        # spot_commission = (spot_entry_volume + spot_exit_volume) * commission_rate
+        # 
+        # Комиссия от фьючерса
+        # futures_commission = (futures_entry_volume + futures_exit_volume) * commission_rate
+        # 
+        # Средняя комиссия (так как это одна позиция с хеджем)
+        # commission = (spot_commission + futures_commission) / 2
         
         # 5. Чистая прибыль/убыток
-        # Net PnL = Price PnL + Funding - Commission
         net_pnl = price_pnl + total_funding_received - commission
         
         return {
@@ -99,23 +75,13 @@ class PnLCalculator:
     ) -> Dict[str, float]:
         """
         Рассчитывает изменение спреда между входом и выходом.
-        
-        Args:
-            entry_spread_pct: Спред при входе (%)
-            close_spread_pct: Спред при выходе (%)
-        
-        Returns:
-            dict: {
-                "spread_change": Изменение спреда,
-                "spread_direction": "narrowed" | "widened" | "unchanged"
-            }
         """
         spread_change = close_spread_pct - entry_spread_pct
         
         if spread_change < -0.01:
-            direction = "narrowed"  # Спред сузился (хорошо)
+            direction = "narrowed"
         elif spread_change > 0.01:
-            direction = "widened"   # Спред расширился (плохо)
+            direction = "widened"
         else:
             direction = "unchanged"
         
