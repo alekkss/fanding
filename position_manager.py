@@ -235,11 +235,11 @@ class MultiPositionManager:
             return len(self.positions)
     
     def close_position_with_pnl(
-    self,
-    crypto: str,
-    close_spot_price: float,
-    close_futures_price: float
-) -> Optional[dict]:
+        self,
+        crypto: str,
+        close_spot_price: float,
+        close_futures_price: float
+    ) -> Optional[dict]:
         """
         Закрывает позицию, считает PnL с учетом РЕАЛЬНОГО фандинга и сохраняет в историю.
         """
@@ -255,20 +255,7 @@ class MultiPositionManager:
             from funding_calculator import RealizedFundingCalculator
             from config import COMMISSION_PCT
             
-            # 2. Подготовка данных
-            avg_entry_price = (position["spot_entry_price"] + position["futures_entry_price"]) / 2
-            avg_exit_price = (close_spot_price + close_futures_price) / 2
-            
-            # Размер позиции в USDT (среднее)
-            position_size = (
-                (position["spot_qty"] * position["spot_entry_price"]) +
-                (position["futures_qty"] * position["futures_entry_price"])
-            ) / 2
-            
-            # Комиссия: 0.2% -> 0.002
-            commission_rate = COMMISSION_PCT / 100.0
-            
-            # 3. 🆕 РАСЧЕТ РЕАЛЬНОГО ФАНДИНГА через API
+            # 2. 🆕 РАСЧЕТ РЕАЛЬНОГО ФАНДИНГА через API
             entry_timestamp = position.get("entry_timestamp")
             logger.info(f"[{crypto}] 💰 Рассчитываем накопленный фандинг с момента открытия...")
             
@@ -278,21 +265,43 @@ class MultiPositionManager:
                     start_time_iso=entry_timestamp,
                     end_time_iso=None  # До текущего момента
                 )
-                logger.info(f"[{crypto}] ✅ Накопленный фандинг: {accumulated_funding:.4f} USDT")
+                
+                if accumulated_funding is None:
+                    logger.error(f"[{crypto}] ❌ Не удалось получить данные фандинга!")
+                    logger.warning(f"[{crypto}] ⚠️ PnL будет рассчитан БЕЗ учета фандинга")
+                    accumulated_funding = 0.0
+                    funding_error = True
+                else:
+                    logger.info(f"[{crypto}] ✅ Накопленный фандинг: {accumulated_funding:.4f} USDT")
+                    funding_error = False
+                    
             except Exception as e:
                 logger.error(f"[{crypto}] ❌ Ошибка расчета фандинга: {e}")
                 accumulated_funding = 0.0
+                funding_error = True
             
-            # 4. Вызов калькулятора PnL
+            # 3. Комиссия: 0.2% -> 0.002
+            commission_rate = COMMISSION_PCT / 100.0
+            
+            # 4. 🆕 ПРАВИЛЬНЫЙ РАСЧЕТ PnL ДЛЯ АРБИТРАЖА
             pnl_result = PnLCalculator.calculate_pnl(
-                entry_price=avg_entry_price,
-                exit_price=avg_exit_price,
-                position_size=position_size,
+                spot_entry_price=position["spot_entry_price"],
+                spot_exit_price=close_spot_price,
+                futures_entry_price=position["futures_entry_price"],
+                futures_exit_price=close_futures_price,
+                spot_qty=position["spot_qty"],
+                futures_qty=position["futures_qty"],
                 commission_rate=commission_rate,
-                total_funding_received=accumulated_funding  # 🆕 Реальные данные!
+                total_funding_received=accumulated_funding
             )
             
-            # 5. Формирование записи для истории
+            # 5. Расчет изменения спреда
+            spread_info = PnLCalculator.calculate_spread_change(
+                entry_spread_pct=position.get("entry_spread_pct", 0),
+                close_spread_pct=(close_futures_price - close_spot_price) / close_spot_price * 100
+            )
+            
+            # 6. Формирование записи для истории
             closed_position = {
                 "crypto": crypto,
                 "entry_time": entry_timestamp,
@@ -303,25 +312,47 @@ class MultiPositionManager:
                 "futures_close_price": close_futures_price,
                 "spot_qty": position["spot_qty"],
                 "futures_qty": position["futures_qty"],
-                "position_size_usdt": position_size,
                 "entry_spread_pct": position.get("entry_spread_pct", 0),
                 "close_spread_pct": (close_futures_price - close_spot_price) / close_spot_price * 100,
+                "spread_change": spread_info["spread_change"],
+                "spread_direction": spread_info["spread_direction"],
                 "funding_payments_count": position.get("funding_payments_count", 0),
-                "accumulated_funding": accumulated_funding,  # 🆕 Сохраняем фандинг
+                "accumulated_funding": accumulated_funding,
+                "funding_error": funding_error,  # 🆕 Флаг ошибки фандинга
                 "pnl": pnl_result
             }
             
-            # 6. Сохранение и очистка
+            # 7. Сохранение и очистка
             self._save_closed_position(closed_position)
             
-            # 🆕 Улучшенный лог с деталями
-            logger.info(
-                f"💰 Закрыта позиция {crypto}:\n"
-                f"   ├─ Price PnL:    {pnl_result['price_pnl']:+.4f} USDT\n"
-                f"   ├─ Funding:      {pnl_result['funding']:+.4f} USDT ({position.get('funding_payments_count', 0)} выплат)\n"
-                f"   ├─ Commission:   {pnl_result['commission']:.4f} USDT\n"
-                f"   └─ Net PnL:      {pnl_result['net_pnl']:+.4f} USDT"
-            )
+            # 8. 🆕 УЛУЧШЕННЫЙ ЛОГ с детальной разбивкой
+            logger.info("="*70)
+            logger.info(f"💰 ЗАКРЫТА ПОЗИЦИЯ: {crypto}")
+            logger.info("="*70)
+            logger.info(f"📊 ЦЕНЫ:")
+            logger.info(f"   Спот:     {position['spot_entry_price']:.6f} → {close_spot_price:.6f} "
+                    f"({((close_spot_price/position['spot_entry_price']-1)*100):+.2f}%)")
+            logger.info(f"   Фьючерс:  {position['futures_entry_price']:.6f} → {close_futures_price:.6f} "
+                    f"({((close_futures_price/position['futures_entry_price']-1)*100):+.2f}%)")
+            logger.info(f"")
+            logger.info(f"📈 СПРЕД:")
+            logger.info(f"   Вход:     {position.get('entry_spread_pct', 0):.4f}%")
+            logger.info(f"   Выход:    {closed_position['close_spread_pct']:.4f}%")
+            logger.info(f"   Изменение: {spread_info['spread_change']:+.4f}% ({spread_info['spread_direction']})")
+            logger.info(f"")
+            logger.info(f"💵 PnL BREAKDOWN:")
+            logger.info(f"   ├─ Спот PnL:      {pnl_result['spot_pnl']:+.4f} USDT")
+            logger.info(f"   ├─ Фьючерс PnL:   {pnl_result['futures_pnl']:+.4f} USDT")
+            logger.info(f"   ├─ Price PnL:     {pnl_result['price_pnl']:+.4f} USDT")
+            
+            if funding_error:
+                logger.warning(f"   ├─ Funding:       ⚠️ ОШИБКА РАСЧЕТА")
+            else:
+                logger.info(f"   ├─ Funding:       {pnl_result['funding']:+.4f} USDT")
+            
+            logger.info(f"   ├─ Commission:    -{pnl_result['commission']:.4f} USDT")
+            logger.info(f"   └─ NET PnL:       {pnl_result['net_pnl']:+.4f} USDT {'✅' if pnl_result['net_pnl'] > 0 else '❌'}")
+            logger.info("="*70)
             
             # Удаляем открытую позицию (и файл json)
             self.clear_position(crypto)

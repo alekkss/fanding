@@ -1,0 +1,90 @@
+[
+  {
+    "crypto": "TAC",
+    "entry_time": "2025-12-08T10:10:56.208279",
+    "close_time": "2025-12-08T23:48:42.946599",
+    "spot_entry_price": 0.004397,
+    "futures_entry_price": 0.004409,
+    "spot_close_price": 0.004445,
+    "futures_close_price": 0.004454,
+    "spot_qty": 6816.7078,
+    "futures_qty": 6800.0,
+    "position_size_usdt": 29.977132098299997,
+    "entry_spread_pct": 0.2729133500113682,
+    "close_spread_pct": 0.2024746906636549,
+    "funding_payments_count": 165,
+    "accumulated_funding": 0.04584655,
+    "pnl": {
+      "net_pnl": 0.2006,
+      "price_pnl": 0.3166,
+      "commission": 0.1619,
+      "funding": 0.0458
+    }
+  },
+  {
+    "crypto": "ROAM",
+    "entry_time": "2025-12-08T23:56:35.033330",
+    "close_time": "2025-12-09T00:51:59.506301",
+    "spot_entry_price": 0.07219,
+    "futures_entry_price": 0.07239,
+    "spot_close_price": 0.07338,
+    "futures_close_price": 0.07362,
+    "spot_qty": 414.82197399999995,
+    "futures_qty": 414.0,
+    "position_size_usdt": 29.957729151529996,
+    "entry_spread_pct": 0.27704668236596736,
+    "close_spread_pct": 0.3270645952575689,
+    "funding_payments_count": 12,
+    "accumulated_funding": 0.0,
+    "pnl": {
+      "net_pnl": 0.3397,
+      "price_pnl": 0.5014,
+      "commission": 0.1618,
+      "funding": 0.0
+    }
+  },
+  {
+    "crypto": "OBT",
+    "entry_time": "2025-12-09T01:17:13.579900",
+    "close_time": "2025-12-09T03:22:51.706548",
+    "spot_entry_price": 0.002426,
+    "futures_entry_price": 0.002429,
+    "spot_close_price": 0.002418,
+    "futures_close_price": 0.002426,
+    "spot_qty": 12343.64138,
+    "futures_qty": 12350.0,
+    "position_size_usdt": 29.97191199394,
+    "entry_spread_pct": 0.12366034624896802,
+    "close_spread_pct": 0.33085194375517757,
+    "funding_payments_count": 26,
+    "accumulated_funding": 0.0007495,
+    "pnl": {
+      "net_pnl": -0.229,
+      "price_pnl": -0.0679,
+      "commission": 0.1618,
+      "funding": 0.0007
+    }
+  },
+  {
+    "crypto": "TAC",
+    "entry_time": "2025-12-09T03:23:33.876963",
+    "close_time": "2025-12-09T04:18:58.358720",
+    "spot_entry_price": 0.004546,
+    "futures_entry_price": 0.004552,
+    "spot_close_price": 0.004494,
+    "futures_close_price": 0.004509,
+    "spot_qty": 6587.32144,
+    "futures_qty": 6590.0,
+    "position_size_usdt": 29.971821633119998,
+    "entry_spread_pct": 0.13198416190057038,
+    "close_spread_pct": 0.33377837116155445,
+    "funding_payments_count": 12,
+    "accumulated_funding": 0.0,
+    "pnl": {
+      "net_pnl": -0.4748,
+      "price_pnl": -0.313,
+      "commission": 0.1618,
+      "funding": 0.0
+    }
+  }
+]
