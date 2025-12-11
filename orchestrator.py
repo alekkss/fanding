@@ -65,11 +65,6 @@ class MultiCryptoOrchestrator:
         try:
             logger.info(f"[{crypto}] 🎯 Попытка открыть позицию")
             
-            # ✅ НОВОЕ: Дополнительная проверка перед запуском
-            if self.position_manager.has_position(crypto):
-                logger.warning(f"[{crypto}] ⚠️ Позиция уже открыта (другим потоком), отмена")
-                return False
-            
             success = OpportunityMonitor.monitor_and_execute(
                 crypto, opportunity_data, self.position_manager
             )
@@ -79,14 +74,7 @@ class MultiCryptoOrchestrator:
                 
                 # Запускаем поток мониторинга
                 with self.lock:
-                    # ✅ НОВОЕ: Проверяем что мониторинг еще не запущен
-                    if crypto in self.active_threads:
-                        logger.warning(f"[{crypto}] ⚠️ Мониторинг уже запущен, пропускаем")
-                        return True
-                    
-                    # Добавляем ПЕРЕД запуском потока
                     self.active_threads.add(crypto)
-                    logger.debug(f"[{crypto}] ➕ Добавлен в active_threads для мониторинга")
                 
                 monitor_thread = threading.Thread(
                     target=self.monitor_position,
@@ -105,10 +93,8 @@ class MultiCryptoOrchestrator:
             return False
             
         finally:
-            # ✅ ОБЯЗАТЕЛЬНО: Удаляем из active_threads в любом случае
             with self.lock:
                 self.active_threads.discard(f"open_{crypto}")
-                logger.debug(f"[{crypto}] ➖ Поток открытия завершен, удален из active_threads")
     
     def restore_monitoring(self) -> None:
         """
@@ -137,9 +123,6 @@ class MultiCryptoOrchestrator:
             
             # Добавляем в активные потоки
             with self.lock:
-                if crypto in self.active_threads:
-                    logger.warning(f"[{crypto}] ⚠️ Уже в active_threads, пропускаем")
-                    continue
                 self.active_threads.add(crypto)
             
             # Запускаем поток мониторинга
@@ -160,14 +143,6 @@ class MultiCryptoOrchestrator:
             # Получаем открытые позиции
             open_positions = self.position_manager.get_open_cryptos()
             open_count = len(open_positions)
-            
-            # ✅ НОВОЕ: Логируем активные потоки
-            with self.lock:
-                active_count = len(self.active_threads)
-                if active_count > 0:
-                    active_list = ", ".join(sorted(self.active_threads))
-                    logger.info(f"🔄 Активные потоки ({active_count}): {active_list}")
-            
             logger.info(f"📊 Открытых позиций: {open_count}/{MAX_CONCURRENT_POSITIONS}")
             
             if open_count >= MAX_CONCURRENT_POSITIONS:
@@ -225,38 +200,24 @@ class MultiCryptoOrchestrator:
             for opp in opportunities:
                 crypto = opp['crypto']
                 
-                # ✅ УЛУЧШЕННЫЕ ПРОВЕРКИ
+                # Проверка blacklist
+                if blacklist_manager.is_blacklisted(crypto):
+                    logger.warning(f"[{crypto}] 🚫 В blacklist, пропускаем")
+                    continue
+                
                 with self.lock:
-                    # Проверка 1: blacklist
-                    if blacklist_manager.is_blacklisted(crypto):
-                        logger.info(f"[{crypto}] ⏭️ Пропуск: в blacklist")
-                        continue
-                    
-                    # Проверка 2: позиция уже открыта
+                    # Проверка что позиция не открыта
                     if self.position_manager.has_position(crypto):
-                        logger.info(f"[{crypto}] ⏭️ Пропуск: позиция уже открыта")
                         continue
                     
-                    # Проверка 3: поток открытия уже активен
-                    if f"open_{crypto}" in self.active_threads:
-                        logger.info(f"[{crypto}] ⏭️ Пропуск: поток открытия активен")
-                        continue
-                    
-                    # Проверка 4: поток мониторинга уже активен
-                    if crypto in self.active_threads:
-                        logger.info(f"[{crypto}] ⏭️ Пропуск: поток мониторинга активен")
-                        continue
-                    
-                    # Проверка 5: лимит позиций
+                    # Проверка лимита позиций
                     if self.position_manager.get_positions_count() >= MAX_CONCURRENT_POSITIONS:
-                        logger.info(f"⏸️ Достигнут лимит позиций при обработке {crypto}")
                         break
                     
-                    # ✅ ВСЕ ПРОВЕРКИ ПРОШЛИ - добавляем в active_threads
+                    # Добавляем в active_threads
                     self.active_threads.add(f"open_{crypto}")
-                    logger.debug(f"[{crypto}] ➕ Добавлен в active_threads: open_{crypto}")
                 
-                # Запуск потока ВНЕ lock (чтобы не блокировать)
+                # Запуск потока
                 open_thread = threading.Thread(
                     target=self.try_open_position,
                     args=(crypto, opp),
@@ -265,17 +226,15 @@ class MultiCryptoOrchestrator:
                 )
                 open_thread.start()
                 logger.info(f"[{crypto}] 🚀 Запущен поток открытия позиции")
-                time.sleep(1)  # Небольшая задержка между запусками
+                time.sleep(1)
                 
         except Exception as e:
             logger.error(f"❌ Ошибка сканирования: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
     
     def run(self) -> None:
         """Главный цикл оркестратора"""
         logger.info("="*60)
-        logger.info("🚀 START MULTI-CRYPTO ARBITRAGE TRADER v3.1")
+        logger.info("🚀 START MULTI-CRYPTO ARBITRAGE TRADER v3.0")
         logger.info(f"📊 Макс. одновременных позиций: {MAX_CONCURRENT_POSITIONS}")
         logger.info(f"⏱️  Интервал сканирования: {SCAN_INTERVAL_SEC}s")
         logger.info("="*60)
@@ -297,8 +256,6 @@ class MultiCryptoOrchestrator:
                     
                 except Exception as e:
                     logger.error(f"❌ Ошибка в главном цикле: {e}")
-                    import traceback
-                    logger.error(traceback.format_exc())
                     time.sleep(30)
                     
         finally:
@@ -315,17 +272,10 @@ class MultiCryptoOrchestrator:
                 active_count = len(self.active_threads)
                 if active_count == 0:
                     break
-                
-                active_list = ", ".join(sorted(self.active_threads))
-                logger.info(f"⏳ Ожидание завершения {active_count} потоков: {active_list}")
-            
+                logger.info(f"⏳ Ожидание завершения {active_count} потоков...")
             time.sleep(1)
         
-        with self.lock:
-            if len(self.active_threads) > 0:
-                logger.warning(f"⚠️ Остались активные потоки: {', '.join(self.active_threads)}")
-            else:
-                logger.info("✅ Все потоки завершены")
+        logger.info("✅ Все потоки завершены")
 
 def main():
     orchestrator = MultiCryptoOrchestrator()
