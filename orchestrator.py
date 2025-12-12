@@ -5,6 +5,7 @@
 import logging
 import time
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Set
 
 from position_manager import MultiPositionManager
@@ -16,11 +17,12 @@ from opportunity_monitor import OpportunityMonitor
 from blacklist_manager import blacklist_manager
 from logger_config import setup_logging
 from config import (
-    MIN_SPREAD_PCT, MAX_CONCURRENT_POSITIONS,
+    MIN_SPREAD_PCT, MAX_CONCURRENT_POSITIONS, 
     MAX_TRADING_THREADS, SCAN_INTERVAL_SEC
 )
 
 logger = setup_logging()
+
 
 class MultiCryptoOrchestrator:
     """Оркестратор для торговли несколькими криптовалютами одновременно"""
@@ -38,6 +40,7 @@ class MultiCryptoOrchestrator:
             
             while not self.shutdown_event.is_set():
                 position = self.position_manager.get_position(crypto)
+                
                 if not position:
                     logger.warning(f"[{crypto}] Позиция исчезла, завершаем мониторинг")
                     break
@@ -51,10 +54,9 @@ class MultiCryptoOrchestrator:
                     break
                 
                 time.sleep(5)
-                
+            
         except Exception as e:
             logger.error(f"[{crypto}] ❌ Ошибка мониторинга: {e}")
-            
         finally:
             with self.lock:
                 self.active_threads.discard(crypto)
@@ -72,10 +74,6 @@ class MultiCryptoOrchestrator:
             if success:
                 logger.info(f"[{crypto}] ✅ Позиция успешно открыта")
                 
-                # Запускаем поток мониторинга
-                with self.lock:
-                    self.active_threads.add(crypto)
-                
                 monitor_thread = threading.Thread(
                     target=self.monitor_position,
                     args=(crypto,),
@@ -83,6 +81,7 @@ class MultiCryptoOrchestrator:
                     daemon=True
                 )
                 monitor_thread.start()
+                
                 return True
             else:
                 logger.warning(f"[{crypto}] ⚠️ Не удалось открыть позицию")
@@ -91,14 +90,13 @@ class MultiCryptoOrchestrator:
         except Exception as e:
             logger.error(f"[{crypto}] ❌ Ошибка открытия позиции: {e}")
             return False
-            
         finally:
             with self.lock:
                 self.active_threads.discard(f"open_{crypto}")
     
     def restore_monitoring(self) -> None:
         """
-        Восстанавливает мониторинг для существующих позиций
+        НОВАЯ ФУНКЦИЯ: Восстанавливает мониторинг для существующих позиций
         Вызывается при старте программы
         """
         open_positions = self.position_manager.get_open_cryptos()
@@ -111,6 +109,7 @@ class MultiCryptoOrchestrator:
         
         for crypto in open_positions:
             position = self.position_manager.get_position(crypto)
+            
             if not position:
                 logger.warning(f"[{crypto}] Позиция в списке, но не найдена в менеджере")
                 continue
@@ -133,6 +132,7 @@ class MultiCryptoOrchestrator:
                 daemon=True
             )
             monitor_thread.start()
+            
             logger.info(f"[{crypto}] ✅ Мониторинг восстановлен")
         
         logger.info(f"✅ Мониторинг восстановлен для {len(open_positions)} позиций")
@@ -140,22 +140,24 @@ class MultiCryptoOrchestrator:
     def scan_opportunities(self) -> None:
         """Сканирует рынок на возможности и открывает позиции"""
         try:
-            # Получаем открытые позиции
+            # ✅ НОВОЕ: Импорт blacklist_manager
+            from blacklist_manager import blacklist_manager
+            
             open_positions = self.position_manager.get_open_cryptos()
             open_count = len(open_positions)
+            
             logger.info(f"📊 Открытых позиций: {open_count}/{MAX_CONCURRENT_POSITIONS}")
             
             if open_count >= MAX_CONCURRENT_POSITIONS:
                 logger.info(f"⏸️ Достигнут лимит позиций ({MAX_CONCURRENT_POSITIONS}), ждем закрытия")
                 return
             
-            # Получение символов
             symbols = PriceFetcher.get_all_symbols()
             if not symbols:
                 logger.error("Не удалось получить символы")
                 return
             
-            # Фильтрация blacklist
+            # ✅ НОВОЕ: Фильтруем blacklist
             blacklisted = blacklist_manager.get_blacklist()
             symbols_before = len(symbols)
             symbols = [s for s in symbols if s not in blacklisted]
@@ -165,15 +167,14 @@ class MultiCryptoOrchestrator:
                 if filtered_count > 0:
                     logger.info(f"🚫 Исключено из blacklist: {filtered_count} пар ({', '.join(sorted(blacklisted))})")
             
-            # Фильтрация открытых позиций
             available_symbols = [s for s in symbols if s not in open_positions]
+            
             logger.info(f"📈 Доступно для торговли: {len(available_symbols)} пар")
             
             if not available_symbols:
                 logger.info("Все доступные пары уже в торговле или в blacklist")
                 return
             
-            # Получение и анализ данных
             orderbooks = PriceFetcher.get_orderbook_batch(available_symbols)
             if not orderbooks:
                 logger.error("Не удалось получить orderbook")
@@ -196,28 +197,23 @@ class MultiCryptoOrchestrator:
                 logger.info("Нет прибыльных возможностей")
                 return
             
-            # Обработка возможностей
             for opp in opportunities:
                 crypto = opp['crypto']
                 
-                # Проверка blacklist
+                # ✅ НОВОЕ: Дополнительная проверка blacklist перед открытием позиции
                 if blacklist_manager.is_blacklisted(crypto):
                     logger.warning(f"[{crypto}] 🚫 В blacklist, пропускаем")
                     continue
                 
                 with self.lock:
-                    # Проверка что позиция не открыта
                     if self.position_manager.has_position(crypto):
                         continue
                     
-                    # Проверка лимита позиций
                     if self.position_manager.get_positions_count() >= MAX_CONCURRENT_POSITIONS:
                         break
                     
-                    # Добавляем в active_threads
                     self.active_threads.add(f"open_{crypto}")
                 
-                # Запуск потока
                 open_thread = threading.Thread(
                     target=self.try_open_position,
                     args=(crypto, opp),
@@ -227,7 +223,7 @@ class MultiCryptoOrchestrator:
                 open_thread.start()
                 logger.info(f"[{crypto}] 🚀 Запущен поток открытия позиции")
                 time.sleep(1)
-                
+        
         except Exception as e:
             logger.error(f"❌ Ошибка сканирования: {e}")
     
@@ -236,28 +232,29 @@ class MultiCryptoOrchestrator:
         logger.info("="*60)
         logger.info("🚀 START MULTI-CRYPTO ARBITRAGE TRADER v3.0")
         logger.info(f"📊 Макс. одновременных позиций: {MAX_CONCURRENT_POSITIONS}")
-        logger.info(f"⏱️  Интервал сканирования: {SCAN_INTERVAL_SEC}s")
+        logger.info(f"⏱️ Интервал сканирования: {SCAN_INTERVAL_SEC}s")
         logger.info("="*60)
         
-        # Восстанавливаем мониторинг существующих позиций
+        # ✅ НОВОЕ: Восстанавливаем мониторинг существующих позиций
         self.restore_monitoring()
         
         try:
             while not self.shutdown_event.is_set():
                 try:
                     self.scan_opportunities()
+                    
                     logger.info(f"⏸️ Ожидание {SCAN_INTERVAL_SEC}s до следующего сканирования...")
                     time.sleep(SCAN_INTERVAL_SEC)
-                    
+                
                 except KeyboardInterrupt:
                     logger.info("👋 Получен сигнал остановки (Ctrl+C)")
                     self.shutdown()
                     break
-                    
+                
                 except Exception as e:
                     logger.error(f"❌ Ошибка в главном цикле: {e}")
                     time.sleep(30)
-                    
+        
         finally:
             logger.info("🛑 Оркестратор остановлен")
     
@@ -266,20 +263,23 @@ class MultiCryptoOrchestrator:
         logger.info("🛑 Инициирована остановка...")
         self.shutdown_event.set()
         
-        # Ждем завершения всех потоков
         for i in range(30):
             with self.lock:
                 active_count = len(self.active_threads)
-                if active_count == 0:
-                    break
-                logger.info(f"⏳ Ожидание завершения {active_count} потоков...")
+            
+            if active_count == 0:
+                break
+            
+            logger.info(f"⏳ Ожидание завершения {active_count} потоков...")
             time.sleep(1)
         
         logger.info("✅ Все потоки завершены")
 
+
 def main():
     orchestrator = MultiCryptoOrchestrator()
     orchestrator.run()
+
 
 if __name__ == "__main__":
     main()
