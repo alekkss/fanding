@@ -48,10 +48,7 @@
 │   ├── logger_config.py             # Конфигурация логирования
 │   └── utils.py                     # Утилиты (timestamp корректировка)
 │
-└── /data/                           # Генерируется автоматически
-    ├── positions/                   # JSON файлы открытых позиций
-    │   ├── BTC.json
-    │   ├── ETH.json
+└── positions/                   # JSON файлы открытых позиций
     │   └── closed_positions_history.json
     └── blacklist.json               # Список исключенных криптовалют
 ```
