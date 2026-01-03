@@ -1,0 +1,27 @@
+{
+  "A8": {
+    "reason": "Futures error: Code 30228: No new positions during delisting.",
+    "error_code": 30228,
+    "timestamp": "2025-11-20T20:41:27.122717"
+  },
+  "ETHW": {
+    "reason": "Futures error: Code 30228: No new positions during delisting.",
+    "error_code": 30228,
+    "timestamp": "2025-11-21T07:09:09.060994"
+  },
+  "MILK": {
+    "reason": "Futures error: Code 30228: No new positions during delisting.",
+    "error_code": 30228,
+    "timestamp": "2025-11-29T20:18:20.486395"
+  },
+  "MYRO": {
+    "reason": "Futures error: Code 30228: No new positions during delisting.",
+    "error_code": 30228,
+    "timestamp": "2025-12-01T02:23:35.824839"
+  },
+  "OBOL": {
+    "reason": "Futures error: Code 30228: No new positions during delisting.",
+    "error_code": 30228,
+    "timestamp": "2025-12-11T22:50:35.981155"
+  }
+}

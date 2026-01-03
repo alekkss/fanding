@@ -1,0 +1,15 @@
+{
+  "crypto": "BOBA",
+  "spot_entry_price": 0.04162,
+  "futures_entry_price": 0.04181,
+  "spot_qty": 719.50256,
+  "futures_qty": 717.5,
+  "entry_spread_pct": 0.45651129264777196,
+  "addition_buy_spreads": [],
+  "entry_timestamp": "2026-01-03T12:57:59.415392",
+  "target_close_spread_pct": 0.15,
+  "funding_payments_count": 16,
+  "last_funding_check_time": "2026-01-03T14:13:25.421620",
+  "low_fr_count": 0,
+  "consecutive_low_fr": false
+}
