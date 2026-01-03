@@ -9,6 +9,7 @@ from typing import Generator
 from sqlalchemy import create_engine, event
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import sessionmaker, Session, declarative_base
+from sqlalchemy import text
 
 logger = logging.getLogger(__name__)
 
@@ -135,7 +136,7 @@ def check_db_connection() -> bool:
     """
     try:
         with engine.connect() as conn:
-            conn.execute("SELECT 1")
+            conn.execute(text("SELECT 1"))  # ← ИСПРАВЛЕНИЕ
         logger.info("✅ Подключение к БД успешно")
         return True
     except Exception as e:
