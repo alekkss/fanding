@@ -8,7 +8,9 @@
 - **Strategy**: Spot-Futures Arbitrage (Cash & Carry)
 - **Concurrency**: Threading + ThreadPoolExecutor
 - **Rate Limiting**: Token Bucket Algorithm
-- **Storage**: JSON-файлы (позиции, blacklist, история)
+- **Storage**: SQLite база данных (SQLAlchemy ORM)
+- **Migrations**: Alembic для управления схемой БД
+- **Design Pattern**: Repository Pattern + Dependency Injection
 - **Logging**: Структурированное логирование с уровнями
 
 ## Структура проекта
@@ -17,9 +19,30 @@
 /
 ├── main.py                          # Точка входа (запускает orchestrator)
 ├── .env                             # Конфигурация (API ключи Bybit)
+├── arbitrage.db                     # SQLite база данных
 │
 ├── orchestrator.py                  # Главный координатор: сканирование + многопоточный мониторинг
 ├── config.py                        # Все константы и пороговые значения
+│
+├── /database/                       # 🆕 Слой работы с БД
+│   ├── __init__.py
+│   ├── database.py                  # Инициализация БД, SQLAlchemy engine, session
+│   ├── models.py                    # SQLAlchemy модели (Position, ClosedPosition, Blacklist)
+│   └── /repositories/               # Repository Pattern для доступа к данным
+│       ├── __init__.py
+│       ├── position_repository.py   # CRUD операции с позициями
+│       ├── history_repository.py    # Работа с историей закрытых позиций
+│       └── blacklist_repository.py  # Работа с blacklist
+│
+├── /migrations/                     # 🆕 Alembic миграции БД
+│   ├── env.py                       # Конфигурация Alembic
+│   ├── script.py.mako               # Шаблон для новых миграций
+│   ├── alembic.ini                  # Настройки Alembic
+│   └── /versions/                   # История миграций
+│       └── xxx_initial_schema.py
+│
+├── /scripts/                        # 🆕 Утилиты и скрипты
+│   └── migrate_blacklist_to_db.py   # Миграция blacklist.json → БД (одноразовый)
 │
 ├── /api/
 │   ├── api_client.py                # Базовый клиент Bybit API (GET/POST с retry)
@@ -35,33 +58,124 @@
 │   └── order_executor.py            # Размещение ордеров (спот/фьючерс)
 │
 ├── /managers/
-│   ├── position_manager.py          # Управление позициями (MultiPositionManager)
-│   ├── blacklist_manager.py         # Управление blacklist (Singleton)
+│   ├── position_manager.py          # Управление позициями через репозитории (DI)
+│   ├── blacklist_manager.py         # Управление blacklist через репозитории (DI)
 │   ├── leverage_manager.py          # Установка плеча
 │   └── balance.py                   # Получение балансов
 │
 ├── /calculators/
 │   ├── pnl_calculator.py            # Расчет PnL при закрытии
-│   ├── funding_calculator.py        # Расчет РЕАЛЬНОГО фандинга через API
+│   └── funding_calculator.py        # Расчет РЕАЛЬНОГО фандинга через API
 │
-├── /utils/
-│   ├── logger_config.py             # Конфигурация логирования
-│   └── utils.py                     # Утилиты (timestamp корректировка)
-│
-└── positions/                   # JSON файлы открытых позиций
-    │   └── closed_positions_history.json
-    └── blacklist.json               # Список исключенных криптовалют
+└── /utils/
+    ├── logger_config.py             # Конфигурация логирования
+    └── utils.py                     # Утилиты (timestamp корректировка)
 ```
 
 ## Ключевые компоненты
 
-### 1. MultiCryptoOrchestrator (orchestrator.py)
+### 1. Database Layer (database/)
 
-**Главный координатор** с двумя основными функциями:
+**Новый слой доступа к данным с использованием Repository Pattern**
+
+#### database.py
+- Создание SQLAlchemy engine и session factory
+- Проверка подключения к БД (`check_db_connection()`)
+- Настройка SQLite (WAL mode, foreign keys)
+
+#### models.py - SQLAlchemy модели
+```python
+class Position(Base):
+    __tablename__ = 'positions'
+    id = Column(Integer, primary_key=True)
+    crypto = Column(String(20), unique=True, index=True)
+    spot_entry_price = Column(Float)
+    futures_entry_price = Column(Float)
+    spot_qty = Column(Float)
+    futures_qty = Column(Float)
+    entry_spread_pct = Column(Float)
+    entry_timestamp = Column(DateTime)
+    funding_payments_count = Column(Integer, default=0)
+    low_fr_count = Column(Integer, default=0)
+    consecutive_low_fr = Column(Boolean, default=False)
+    # ...
+
+class ClosedPosition(Base):
+    __tablename__ = 'closed_positions'
+    id = Column(Integer, primary_key=True)
+    crypto = Column(String(20), index=True)
+    entry_timestamp = Column(DateTime)
+    close_timestamp = Column(DateTime, index=True)
+    net_pnl = Column(Float)
+    funding_pnl = Column(Float)
+    # ...
+
+class Blacklist(Base):
+    __tablename__ = 'blacklist'
+    id = Column(Integer, primary_key=True)
+    crypto = Column(String(20), unique=True, index=True)
+    reason = Column(Text)
+    error_code = Column(Integer, nullable=True)
+    timestamp = Column(DateTime)
+    # ...
+```
+
+#### Repositories - паттерн доступа к данным
+
+**PositionRepository** (`position_repository.py`)
+- `create_position()` - создание новой позиции
+- `get_by_crypto()` - получение позиции по символу
+- `has_position()` - проверка существования
+- `get_all_open()` - все открытые позиции
+- `increment_funding_count()` - обновление счетчика фандинга
+- `delete_by_crypto()` - удаление позиции
+- `update_position_quantities()` - обновление qty после докупки
+
+**HistoryRepository** (`history_repository.py`)
+- `save_closed_position()` - сохранение закрытой позиции
+- `get_all_history()` - вся история
+- `get_history_by_crypto()` - история по конкретной криптовалюте
+- `get_recent_history()` - последние N закрытых позиций
+- `get_statistics()` - статистика (total PnL, win rate, avg PnL)
+
+**BlacklistRepository** (`blacklist_repository.py`)
+- `add_to_blacklist()` - добавление в blacklist
+- `is_blacklisted()` - проверка наличия
+- `remove_from_blacklist()` - удаление
+- `get_all_blacklisted()` - все записи (Set[str])
+- `get_all_details()` - все записи с деталями
+- `bulk_add()` - массовое добавление (для миграции)
+
+### 2. MultiCryptoOrchestrator (orchestrator.py)
+
+**Главный координатор с Dependency Injection**
+
+#### Инициализация
+```python
+def __init__(self):
+    # Проверка подключения к БД
+    if not check_db_connection():
+        raise RuntimeError("Database connection failed")
+
+    # Создание репозиториев
+    self.position_repo = PositionRepository()
+    self.history_repo = HistoryRepository()
+    self.blacklist_repo = BlacklistRepository()
+
+    # Dependency Injection в менеджеры
+    self.position_manager = MultiPositionManager(
+        position_repo=self.position_repo,
+        history_repo=self.history_repo
+    )
+
+    self.blacklist_manager = BlacklistManager(
+        blacklist_repo=self.blacklist_repo
+    )
+```
 
 #### Сканирование рынка (`scan_opportunities`)
 - Получает список всех торговых пар с Bybit
-- Фильтрует blacklist криптовалюты
+- Фильтрует blacklist криптовалюты (через БД)
 - Анализирует спреды через `SpreadAnalyzer`
 - Получает funding rates
 - Находит топ-N прибыльных возможностей
@@ -74,7 +188,7 @@
   - **Обычный**: FR < -0.001% И спред <= 0.15%
   - **Мягкий**: FR <= 0.005% И спред <= 0.15% (после 15+ раундов с низким FR)
 
-### 2. OpportunityMonitor (opportunity_monitor.py)
+### 3. OpportunityMonitor (opportunity_monitor.py)
 
 **Логика торговли**: открытие и закрытие позиций
 
@@ -89,6 +203,7 @@
 2️⃣ Открытие ФЬЮЧЕРСА (SHORT)  ← СНАЧАЛА!
 3️⃣ Открытие СПОТА (LONG)
    ⚠️ Если спот не открылся → КРИТИЧЕСКАЯ СИТУАЦИЯ
+4️⃣ Сохранение в БД через position_manager.save_position()
 ```
 
 #### Закрытие позиции (`monitor_open_position_single`)
@@ -104,44 +219,59 @@
 Порядок закрытия:
 1️⃣ Продажа СПОТА (по актуальному балансу)
 2️⃣ Покупка ФЬЮЧЕРСА (по сохраненному qty)
+3️⃣ Сохранение в историю через history_repo.save_closed_position()
 ```
 
-### 3. MultiPositionManager (position_manager.py)
+### 4. MultiPositionManager (position_manager.py)
 
-**Управление множественными позициями**:
+**Управление множественными позициями через репозитории**
 
-#### Структура позиции (JSON)
-```json
-{
-  "crypto": "BTC",
-  "spot_entry_price": 50000.12,
-  "futures_entry_price": 50050.45,
-  "spot_qty": 0.0006,
-  "futures_qty": 0.0006,
-  "entry_spread_pct": 0.48,
-  "entry_timestamp": "2026-01-03T10:30:00",
-  "funding_payments_count": 5,
-  "low_fr_count": 2,
-  "consecutive_low_fr": false
-}
+#### Dependency Injection
+```python
+def __init__(
+    self,
+    position_repo: Optional[PositionRepository] = None,
+    history_repo: Optional[HistoryRepository] = None
+):
+    self.position_repo = position_repo or PositionRepository()
+    self.history_repo = history_repo or HistoryRepository()
+    # ...
 ```
 
 #### Ключевые методы
-- `save_position()` - сохранение позиции в `positions/{crypto}.json`
-- `get_position(crypto)` - получение данных позиции
+- `save_position()` - сохранение позиции через репозиторий
+- `get_position(crypto)` - получение данных позиции (dict для совместимости)
 - `has_position(crypto)` - проверка существования
 - `increment_funding_count()` - отслеживание funding rate для мягкого режима
 - `close_position_with_pnl()` - закрытие с расчетом PnL и сохранение в историю
-- `restore_monitoring()` - восстановление мониторинга после перезапуска
+- `get_all_positions()` - все открытые позиции (Dict[str, dict])
+- `get_open_cryptos()` - список символов с открытыми позициями
 
 #### Thread Safety
 - Используется `threading.RLock` (реентерабельный lock)
 - Все операции атомарны
 - Безопасная работа из множественных потоков
 
-### 4. BlacklistManager (blacklist_manager.py)
+#### Backward Compatibility
+- Методы возвращают dict (через `model.to_dict()`) для совместимости с существующим кодом
+- Сигнатуры методов не изменились
 
-**Singleton-менеджер для исключения проблемных пар**
+### 5. BlacklistManager (blacklist_manager.py)
+
+**Singleton-менеджер с кешированием в памяти**
+
+#### Dependency Injection + Caching
+```python
+def __init__(self, blacklist_repo: Optional[BlacklistRepository] = None):
+    self.blacklist_repo = blacklist_repo or BlacklistRepository()
+
+    # Кеш для быстрого доступа
+    self.blacklist: Set[str] = set()
+    self.blacklist_details = {}
+
+    # Загрузка из БД в кеш
+    self._load_blacklist()
+```
 
 #### Критические коды ошибок (автоматическое добавление в blacklist)
 ```python
@@ -152,18 +282,19 @@ CRITICAL_ERROR_CODES = [
 ]
 ```
 
-#### Структура blacklist.json
-```json
-{
-  "LUNA": {
-    "reason": "Futures error: Code 30228: No new positions during delisting",
-    "error_code": 30228,
-    "timestamp": "2026-01-03T10:45:00"
-  }
-}
-```
+#### Ключевые методы
+- `add_to_blacklist()` - добавление в БД + обновление кеша
+- `is_blacklisted()` - быстрая проверка через кеш
+- `remove_from_blacklist()` - удаление из БД + обновление кеша
+- `get_blacklist()` - копия списка
+- `refresh_cache()` - принудительное обновление кеша из БД
 
-### 5. OrderExecutor (order_executor.py)
+#### Performance Optimization
+- Кеширование в памяти для проверок `is_blacklisted()`
+- Автоматическая синхронизация кеша при операциях add/remove
+- Singleton pattern для глобального доступа
+
+### 6. OrderExecutor (order_executor.py)
 
 **Исполнение ордеров с точностью инструмента**
 
@@ -186,7 +317,7 @@ CRITICAL_ERROR_CODES = [
 }
 ```
 
-### 6. PnLCalculator (pnl_calculator.py)
+### 7. PnLCalculator (pnl_calculator.py)
 
 **Расчет прибыли/убытка при закрытии позиции**
 
@@ -213,7 +344,7 @@ pnl_result = PnLCalculator.calculate_pnl(
 )
 ```
 
-### 7. RealizedFundingCalculator (funding_calculator.py)
+### 8. RealizedFundingCalculator (funding_calculator.py)
 
 **Расчет РЕАЛЬНОГО полученного фандинга через Bybit API**
 
@@ -229,7 +360,7 @@ funding_pnl = -execFee
 total_funding = sum(funding_pnl for all executions)
 ```
 
-### 8. Rate Limiter (rate_limiter.py)
+### 9. Rate Limiter (rate_limiter.py)
 
 **Token Bucket алгоритм для защиты от rate limit**
 
@@ -254,6 +385,51 @@ ENDPOINT_WEIGHTS = {
 ```python
 rate_limiter.wait_if_needed(endpoint)  # Блокирует поток если превышен лимит
 ```
+
+## Миграция данных
+
+### Alembic - управление схемой БД
+
+#### Инициализация (уже выполнено)
+```bash
+alembic init migrations
+```
+
+#### Создание миграции
+```bash
+alembic revision --autogenerate -m "initial_schema"
+```
+
+#### Применение миграций
+```bash
+# Применить все миграции
+alembic upgrade head
+
+# Откатить последнюю миграцию
+alembic downgrade -1
+
+# История миграций
+alembic history
+```
+
+### Миграция blacklist.json → БД
+
+**Скрипт**: `scripts/migrate_blacklist_to_db.py`
+
+```bash
+python scripts/migrate_blacklist_to_db.py
+```
+
+**Функции скрипта**:
+1. Проверяет подключение к БД
+2. Загружает `blacklist.json`
+3. Создает бэкап файла (`blacklist.json.backup`)
+4. Показывает что будет мигрировано
+5. Запрашивает подтверждение
+6. Выполняет миграцию через `BlacklistRepository.bulk_add()`
+7. Проверяет успешность миграции
+
+**После миграции**: можно удалить `blacklist.json` (бэкап сохранен)
 
 ## Конфигурация (config.py)
 
@@ -287,25 +463,32 @@ SCAN_INTERVAL_SEC = 180       # Интервал сканирования рын
 MONITOR_INTERVAL_SEC = 300    # Интервал проверки позиций
 ```
 
+### База данных
+```python
+DATABASE_URL = "sqlite:///./arbitrage.db"  # SQLite файл
+```
+
 ## Стандарты кодирования
 
 ### Основные принципы
-- **SOLID**: Четкое разделение ответственности (orchestrator → services → managers → api)
+- **SOLID**: Четкое разделение ответственности + Dependency Inversion
+- **Repository Pattern**: Слой доступа к данным изолирован от бизнес-логики
+- **Dependency Injection**: Репозитории передаются через конструкторы
 - **Thread Safety**: Все shared state защищен locks (RLock)
 - **Async Pattern**: Threading для параллельного мониторинга (daemon threads)
 - **Type Hints**: Обязательная типизация аргументов и возвратов
 - **Error Handling**: Graceful degradation с retry логикой
 
 ### Конвенции именования
-- **Классы**: `PascalCase` (MultiCryptoOrchestrator, PnLCalculator)
-- **Функции**: `snake_case` (monitor_position, calculate_pnl)
-- **Константы**: `UPPER_SNAKE_CASE` (MIN_SPREAD_PCT, TRADE_AMOUNT_USD)
-- **Private методы**: `_leading_underscore` (_save_blacklist, _get_signed)
+- **Классы**: `PascalCase` (MultiCryptoOrchestrator, PnLCalculator, PositionRepository)
+- **Функции**: `snake_case` (monitor_position, calculate_pnl, save_closed_position)
+- **Константы**: `UPPER_SNAKE_CASE` (MIN_SPREAD_PCT, TRADE_AMOUNT_USD, DATABASE_URL)
+- **Private методы**: `_leading_underscore` (_load_blacklist, _get_signed)
 
 ### Обработка ошибок
 ```python
 try:
-    # Критическая операция (API вызов, файл I/O)
+    # Критическая операция (API вызов, БД I/O)
 except SpecificException as e:
     logger.error(f"[{crypto}] Описание: {e}", exc_info=True)
     # Retry или return fallback значение
@@ -315,7 +498,10 @@ except SpecificException as e:
 
 ### Структура логов
 ```
-[2026-01-03 14:30:00] [orchestrator] [INFO] 📊 Открытых позиций: 1/1
+[2026-01-03 14:30:00] [orchestrator] [INFO] 🔧 Инициализация оркестратора...
+[2026-01-03 14:30:00] [orchestrator] [INFO] ✅ Подключение к БД успешно
+[2026-01-03 14:30:00] [orchestrator] [INFO] ✅ Найдено открытых позиций: 1
+[2026-01-03 14:30:00] [orchestrator] [INFO] 📋 Список: BTC
 [2026-01-03 14:30:05] [BTC] [INFO] 🔍 Мониторинг закрытия...
 [2026-01-03 14:30:05] [BTC] [INFO] └─ FR 0.0150% >= -0.001%, ждем снижения FR
 [2026-01-03 14:35:00] [BTC] [INFO] 🔥 Условия закрытия выполнены
@@ -324,24 +510,29 @@ except SpecificException as e:
 ```
 
 ### Уровни
-- `DEBUG`: Детальная информация (API запросы, проверки условий)
-- `INFO`: Основные события (открытие/закрытие позиций, сканирование)
+- `DEBUG`: Детальная информация (API запросы, SQL queries, проверки условий)
+- `INFO`: Основные события (открытие/закрытие позиций, сканирование, БД операции)
 - `WARNING`: Предупреждения (timeout, blacklist добавление)
-- `ERROR`: Ошибки (API failures, файл I/O проблемы)
-- `CRITICAL`: Критические ситуации (фьючерс открыт, спот не открыт)
+- `ERROR`: Ошибки (API failures, БД I/O проблемы)
+- `CRITICAL`: Критические ситуации (фьючерс открыт, спот не открыт, БД недоступна)
 
 ## Сценарии работы
 
 ### 1. Нормальный цикл торговли
 
 ```
-1. Orchestrator.run()
-   ↓
-2. restore_monitoring() - восстановление существующих позиций
-   ↓
-3. scan_opportunities() - каждые 180 секунд
+1. Orchestrator.__init__()
+   ├─ check_db_connection() - проверка подключения к БД
+   ├─ Создание репозиториев (position_repo, history_repo, blacklist_repo)
+   └─ Создание менеджеров с DI
+       ↓
+2. Orchestrator.run()
+   ├─ restore_monitoring() - восстановление мониторинга из БД
+   └─ scan_opportunities() - каждые 180 секунд
+       ↓
+3. scan_opportunities()
    ├─ Получить символы (PriceFetcher.get_all_symbols)
-   ├─ Фильтр blacklist
+   ├─ Фильтр blacklist (через blacklist_manager → кеш → БД)
    ├─ Получить orderbooks (batch)
    ├─ Фильтр по спреду (SpreadAnalyzer)
    ├─ Получить funding rates (batch)
@@ -354,7 +545,7 @@ except SpecificException as e:
    ├─ Установка плеча
    ├─ Открытие ФЬЮЧЕРСА
    ├─ Открытие СПОТА
-   └─ position_manager.save_position()
+   └─ position_manager.save_position() → position_repo.create_position() → БД
        ↓
 5. monitor_position(crypto) - daemon thread
    ├─ Цикл каждые 300 секунд
@@ -366,7 +557,8 @@ except SpecificException as e:
        └─ position_manager.close_position_with_pnl()
            ├─ RealizedFundingCalculator.get_accumulated_funding()
            ├─ PnLCalculator.calculate_pnl()
-           └─ Сохранение в историю
+           ├─ history_repo.save_closed_position() → БД
+           └─ position_repo.delete_by_crypto() → БД
 ```
 
 ### 2. Обработка ошибок при открытии
@@ -375,26 +567,28 @@ except SpecificException as e:
 Сценарий 1: Фьючерс не открылся
 ├─ Логирование ошибки
 ├─ Проверка error_code
-└─ Если критический → blacklist_manager.add_to_blacklist()
+└─ Если критический → blacklist_manager.add_to_blacklist() → БД
 
 Сценарий 2: Фьючерс открыт, спот НЕ открыт (КРИТИЧНО!)
 ├─ logger.critical("НЕОБХОДИМО ВРУЧНУЮ ЗАКРЫТЬ ФЬЮЧЕРС")
 ├─ Логирование qty для ручного закрытия
-└─ Добавление в blacklist (если критический код)
+└─ Добавление в blacklist (если критический код) → БД
 ```
 
 ### 3. Восстановление после перезапуска
 
 ```
 1. Orchestrator.__init__()
-   ↓
-2. MultiPositionManager.__init__()
-   ├─ load_all_positions()
-   └─ Чтение всех JSON из директории positions/
-       ↓
-3. Orchestrator.restore_monitoring()
-   ├─ Получение списка открытых позиций
+   ├─ check_db_connection()
+   ├─ Создание репозиториев
+   └─ MultiPositionManager.__init__()
+       ├─ position_repo.get_positions_count() → БД
+       └─ Логирование количества позиций
+           ↓
+2. Orchestrator.restore_monitoring()
+   ├─ position_manager.get_open_cryptos() → position_repo.get_open_cryptos() → БД
    └─ Для каждой позиции:
+       ├─ Получение данных из БД
        ├─ Логирование данных входа
        ├─ Добавление в active_threads
        └─ Запуск monitor_position() в daemon thread
@@ -431,26 +625,29 @@ Timeout → экспоненциальный backoff
 ## Безопасность и надежность
 
 ### Thread Safety гарантии
-- `MultiPositionManager`: RLock на все операции с `self.positions`
-- `BlacklistManager`: RLock + Singleton pattern
+- `MultiPositionManager`: RLock на все операции
+- `BlacklistManager`: RLock + Singleton pattern + кеш
 - `Orchestrator.active_threads`: threading.Lock для добавления/удаления
+- **SQLAlchemy sessions**: scoped_session для thread-safety
 
 ### Критические проверки
 1. **Перед открытием позиции**:
-   - Проверка blacklist
-   - Проверка уже открытой позиции
+   - Проверка blacklist (кеш + БД)
+   - Проверка уже открытой позиции (БД)
    - Проверка активных потоков открытия
-   - Проверка лимита позиций
+   - Проверка лимита позиций (БД)
 
 2. **Перед закрытием позиции**:
-   - Проверка существования позиции
+   - Проверка существования позиции (БД)
    - Проверка актуального баланса (спот)
    - Проверка сохраненного qty (фьючерс)
 
-### Файловая система
-- Atomic write: `json.dump()` + `os.makedirs(exist_ok=True)`
-- Все файлы UTF-8 encoded
-- История закрытых позиций: append-only в `closed_positions_history.json`
+### База данных
+- **SQLite WAL mode**: параллельное чтение + один писатель
+- **Индексы**: на часто используемые поля (crypto, timestamps)
+- **Foreign Keys**: включены для целостности данных
+- **Транзакции**: автоматический commit/rollback
+- **Connection pool**: через scoped_session
 
 ## Мониторинг и отладка
 
@@ -458,15 +655,15 @@ Timeout → экспоненциальный backoff
 ```python
 # В логах:
 - Количество открытых позиций / MAX_CONCURRENT_POSITIONS
-- Blacklist размер и содержимое
-- Время выполнения операций (сканирование, открытие, закрытие)
+- Blacklist размер и содержимое (из БД)
+- Время выполнения операций (сканирование, открытие, закрытие, БД queries)
 - Rate limit статистика (requests/sec, weight/sec)
 ```
 
 ### Debug режим
 ```python
 # В logger_config.py:
-logging.basicConfig(level=logging.DEBUG)  # Подробные логи
+logging.basicConfig(level=logging.DEBUG)  # Подробные логи + SQL queries
 
 # В main.py:
 if __name__ == "__main__":
@@ -476,15 +673,32 @@ if __name__ == "__main__":
 
 ### Анализ истории
 ```python
-# Чтение closed_positions_history.json:
-import json
-with open("positions/closed_positions_history.json") as f:
-    history = json.load(f)
+# Через repository:
+from database.repositories.history_repository import HistoryRepository
 
-# Анализ PnL:
-total_pnl = sum(pos['pnl']['net_pnl'] for pos in history)
-avg_pnl = total_pnl / len(history)
-win_rate = sum(1 for pos in history if pos['pnl']['net_pnl'] > 0) / len(history)
+repo = HistoryRepository()
+
+# Последние 10 закрытых позиций
+recent = repo.get_recent_history(limit=10)
+for pos in recent:
+    print(f"{pos.crypto}: {pos.net_pnl:+.4f} USDT")
+
+# Статистика
+stats = repo.get_statistics()
+print(f"Total PnL: {stats['total_pnl']:.2f} USDT")
+print(f"Win Rate: {stats['win_rate']:.1%}")
+print(f"Avg PnL: {stats['avg_pnl']:.2f} USDT")
+```
+
+### Просмотр БД
+```bash
+# SQLite CLI
+sqlite3 arbitrage.db
+sqlite> .tables
+sqlite> SELECT * FROM positions;
+sqlite> SELECT crypto, net_pnl FROM closed_positions ORDER BY close_timestamp DESC LIMIT 10;
+
+# Или DB Browser for SQLite (GUI)
 ```
 
 ## Deployment
@@ -492,7 +706,14 @@ win_rate = sum(1 for pos in history if pos['pnl']['net_pnl'] > 0) / len(history)
 ### Требования
 ```
 Python 3.9+
+sqlalchemy>=2.0.0
+alembic>=1.13.0
 requests
+```
+
+### Установка
+```bash
+pip install sqlalchemy alembic requests
 ```
 
 ### Переменные окружения (.env)
@@ -501,16 +722,24 @@ requests
 BYBIT_API_KEY=your_api_key
 BYBIT_API_SECRET=your_api_secret
 
+# База данных (опционально)
+DATABASE_URL=sqlite:///./arbitrage.db
+
 # Опционально (для VPS с неточным временем)
 USE_SERVER_TIME=true
 ```
 
+### Инициализация БД
+```bash
+# Применить все миграции
+alembic upgrade head
+
+# Миграция blacklist.json → БД (если есть старые данные)
+python scripts/migrate_blacklist_to_db.py
+```
+
 ### Запуск
 ```bash
-# Установка зависимостей
-pip install requests
-
-# Запуск бота
 python main.py
 ```
 
@@ -528,37 +757,46 @@ python main.py
 
 ## Roadmap & Known Issues
 
+### Completed ✅
+- [x] База данных вместо JSON (SQLite + SQLAlchemy)
+- [x] Repository Pattern для доступа к данным
+- [x] Alembic для управления миграциями
+- [x] Dependency Injection в менеджеры
+- [x] Скрипт миграции blacklist.json → БД
+
 ### TODO
-- [ ] База данных вместо JSON (SQLite/PostgreSQL)
 - [ ] Telegram бот для уведомлений и управления
 - [ ] Web dashboard для мониторинга (FastAPI + React)
-- [ ] Unit-тесты (pytest)
+- [ ] Unit-тесты (pytest) с mock репозиториями
 - [ ] Backtesting на исторических данных
 - [ ] Поддержка других бирж (Binance, OKX)
+- [ ] PostgreSQL support для production
 
 ### Известные ограничения
 - Максимум 1 одновременная позиция (можно увеличить в config)
 - Bybit rate limits: 120 req/sec, 600 weight/sec (используем 50 и 300)
 - Funding rate обновляется каждые 8 часов (00:00, 08:00, 16:00 UTC)
-- JSON файлы не подходят для высокой нагрузки (миграция на БД)
+- SQLite не подходит для очень высокой нагрузки (миграция на PostgreSQL)
 
 ### Критические зависимости
 - **НЕ изменять** порядок открытия (сначала фьючерс, потом спот)
 - **НЕ изменять** логику RLock в MultiPositionManager (deadlock риск)
 - **ОБЯЗАТЕЛЬНО** сохранять логику закрытия позиций с PnL
 - Проверки blacklist **ОБЯЗАТЕЛЬНЫ** перед каждым открытием
+- **SQLAlchemy sessions** должны быть в контексте `with` для автоматического cleanup
 
 ## Примеры использования
 
 ### Добавление криптовалюты в blacklist вручную
 ```python
-from blacklist_manager import blacklist_manager
+from managers.blacklist_manager import blacklist_manager
 
 blacklist_manager.add_to_blacklist(
     crypto="LUNA",
     reason="Manual blacklist: delisting announcement",
     error_code=None
 )
+# Автоматически сохранится в БД и обновит кеш
 ```
 
 ### Удаление из blacklist
@@ -566,17 +804,52 @@ blacklist_manager.add_to_blacklist(
 blacklist_manager.remove_from_blacklist("LUNA")
 ```
 
-### Просмотр истории PnL
+### Просмотр истории PnL через репозиторий
 ```python
-from position_manager import MultiPositionManager
-import json
+from database.repositories.history_repository import HistoryRepository
+
+repo = HistoryRepository()
+
+# Последние 10 позиций
+recent = repo.get_recent_history(limit=10)
+for pos in recent:
+    print(f"{pos.crypto}: {pos.net_pnl:+.4f} USDT (закрыто {pos.close_timestamp})")
+
+# Статистика
+stats = repo.get_statistics()
+print(f"\nСтатистика:")
+print(f"  Всего сделок: {stats['total_trades']}")
+print(f"  Прибыльных: {stats['winning_trades']}")
+print(f"  Win Rate: {stats['win_rate']:.1%}")
+print(f"  Общий PnL: {stats['total_pnl']:+.2f} USDT")
+print(f"  Средний PnL: {stats['avg_pnl']:+.2f} USDT")
+```
+
+### Получение позиции через менеджер
+```python
+from managers.position_manager import MultiPositionManager
 
 manager = MultiPositionManager()
-with open("positions/closed_positions_history.json") as f:
-    history = json.load(f)
 
-for pos in history[-10:]:  # Последние 10 закрытых позиций
-    print(f"{pos['crypto']}: {pos['pnl']['net_pnl']:+.4f} USDT")
+# Проверка наличия позиции
+if manager.has_position("BTC"):
+    pos = manager.get_position("BTC")
+    print(f"BTC позиция:")
+    print(f"  Вход: спот={pos['spot_entry_price']}, фьюч={pos['futures_entry_price']}")
+    print(f"  Qty: {pos['spot_qty']}")
+    print(f"  Спред: {pos['entry_spread_pct']:.2f}%")
+```
+
+### Создание новой миграции
+```bash
+# После изменения моделей в models.py
+alembic revision --autogenerate -m "add_new_field"
+
+# Применить миграцию
+alembic upgrade head
+
+# Откатить
+alembic downgrade -1
 ```
 
 ## FAQ
@@ -606,13 +879,49 @@ MAX_CONCURRENT_POSITIONS = 3  # Было 1
 ### Что делать если бот упал?
 
 1. Перезапустить бота: `python main.py`
-2. Он автоматически восстановит мониторинг открытых позиций из `positions/*.json`
+2. Он автоматически восстановит мониторинг открытых позиций из БД
 3. Проверить логи на ошибки
+4. Проверить состояние БД: `sqlite3 arbitrage.db` → `SELECT * FROM positions;`
+
+### Как перенести данные на другой сервер?
+
+```bash
+# Скопировать файлы:
+scp arbitrage.db user@server:/path/to/project/
+scp -r migrations/ user@server:/path/to/project/
+
+# На новом сервере:
+alembic upgrade head  # Проверка миграций
+python main.py        # Запуск
+```
+
+### Как перейти с SQLite на PostgreSQL?
+
+1. Установить PostgreSQL и `psycopg2`:
+   ```bash
+   pip install psycopg2-binary
+   ```
+
+2. Изменить `config.py`:
+   ```python
+   DATABASE_URL = "postgresql://user:password@localhost:5432/arbitrage_db"
+   ```
+
+3. Обновить `alembic.ini`:
+   ```ini
+   sqlalchemy.url = postgresql://user:password@localhost:5432/arbitrage_db
+   ```
+
+4. Применить миграции:
+   ```bash
+   alembic upgrade head
+   ```
 
 ---
 
-**Версия документации**: 3.0  
+**Версия документации**: 4.0 (Database Edition)  
 **Дата обновления**: Январь 2026  
 **Автор проекта**: Александр  
 **Exchange**: Bybit  
-**Strategy**: Spot-Futures Arbitrage (Cash & Carry)
+**Strategy**: Spot-Futures Arbitrage (Cash & Carry)  
+**Storage**: SQLite (SQLAlchemy ORM) + Alembic Migrations
