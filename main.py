@@ -1,5 +1,9 @@
-# main.py
-from orchestrator import main
+# -*- coding: utf-8 -*-
+
+from orchestrator import MultiCryptoOrchestrator
+from utils.logger_config import setup_logger
 
 if __name__ == "__main__":
-    main()
+    setup_logger()
+    bot = MultiCryptoOrchestrator()  # ← Изменено
+    bot.run()

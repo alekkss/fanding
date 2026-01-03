@@ -8,14 +8,14 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Set
 
-from position_manager import MultiPositionManager
-from price_service import PriceFetcher
-from spread_analyzer import SpreadAnalyzer
-from funding_rate_service import FundingRateFetcher
-from arbitrage_calculator import ArbitrageCalculator
-from opportunity_monitor import OpportunityMonitor
-from blacklist_manager import blacklist_manager
-from logger_config import setup_logging
+from managers.position_manager import MultiPositionManager
+from services.price_service import PriceFetcher
+from services.spread_analyzer import SpreadAnalyzer
+from services.funding_rate_service import FundingRateFetcher
+from services.arbitrage_calculator import ArbitrageCalculator
+from services.opportunity_monitor import OpportunityMonitor
+from managers.blacklist_manager import blacklist_manager
+from utils.logger_config import setup_logging
 from config import (
     MIN_SPREAD_PCT, MAX_CONCURRENT_POSITIONS, 
     MAX_TRADING_THREADS, SCAN_INTERVAL_SEC
@@ -141,7 +141,7 @@ class MultiCryptoOrchestrator:
         """Сканирует рынок на возможности и открывает позиции"""
         try:
             # ✅ Импорт blacklist_manager
-            from blacklist_manager import blacklist_manager
+            from managers.blacklist_manager import blacklist_manager
             
             open_positions = self.position_manager.get_open_cryptos()
             open_count = len(open_positions)

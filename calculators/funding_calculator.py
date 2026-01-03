@@ -5,8 +5,8 @@ import logging
 import requests
 from datetime import datetime, timedelta
 from typing import Optional
-from auth import get_api_key, get_api_secret, create_signature
-from utils import get_corrected_timestamp
+from api.auth import get_api_key, get_api_secret, create_signature
+from utils.utils import get_corrected_timestamp
 from config import API_BASE_URL, RECV_WINDOW
 
 logger = logging.getLogger(__name__)
