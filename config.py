@@ -31,13 +31,26 @@ MAX_WORKERS_FUNDING = 10
 MAX_REQUESTS_PER_SECOND = 50  # Безопасное значение (Bybit лимит: 120)
 MAX_WEIGHT_PER_SECOND = 300   # Безопасное значение (Bybit лимит: 600)
 
+# ========================================
+# ✅ НОВОЕ: Настройки базы данных
+# ========================================
+DATABASE_URL = "sqlite:///./arbitrage.db"  # SQLite файл в корне проекта
+
+# Для PostgreSQL используйте (закомментировано):
+# DATABASE_URL = "postgresql://user:password@localhost:5432/arbitrage_db"
+
+# Директория для старых JSON файлов (deprecated, используется только для миграции)
+LEGACY_POSITIONS_DIR = "positions_legacy"  # Будет создана при миграции
+# ========================================
+
+
 # НОВОЕ: Параметры многопоточной торговли
 MAX_CONCURRENT_POSITIONS = 1  # Максимум одновременных позиций
 MAX_TRADING_THREADS = 3       # Максимум потоков для торговли
-POSITIONS_DIR = "positions"   # Директория для хранения позиций
+POSITIONS_DIR = "positions"  # Директория для хранения позиций (DEPRECATED - используется БД)
 SCAN_INTERVAL_SEC = 180        # Интервал сканирования новых возможностей
 
-# Файл сохранения позиции
+# Файл сохранения позиции (DEPRECATED - используется БД)
 POSITION_FILE = "open_position.json"
 
 # ✅ НОВОЕ: Список исключений для криптовалют
