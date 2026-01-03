@@ -1,238 +1,301 @@
 # -*- coding: utf-8 -*-
 
-"""Управление множественных позиций: сохранение, загрузка, очистка"""
+"""Управление множественных позиций через базу данных"""
 
-import os
-import json
 import logging
 import threading
 from datetime import datetime
 from typing import Dict, Optional, List
 
+from database.repositories.position_repository import PositionRepository
+from database.repositories.history_repository import HistoryRepository
+
 logger = logging.getLogger(__name__)
 
 
 class MultiPositionManager:
-    """Менеджер для управления несколькими позициями одновременно"""
+    """
+    Менеджер для управления несколькими позициями одновременно.
     
-    def __init__(self, positions_dir: str = "positions"):
-        self.positions_dir = positions_dir
-        self.positions: Dict[str, dict] = {}
+    Рефакторенная версия с использованием Repository Pattern.
+    Все данные хранятся в БД вместо JSON файлов.
+    """
+    
+    def __init__(
+        self,
+        position_repo: Optional[PositionRepository] = None,
+        history_repo: Optional[HistoryRepository] = None
+    ):
+        """
+        Args:
+            position_repo: Репозиторий для работы с позициями (опционально)
+            history_repo: Репозиторий для работы с историей (опционально)
+        """
+        # Dependency Injection: позволяет подменить репозитории для тестов
+        self.position_repo = position_repo or PositionRepository()
+        self.history_repo = history_repo or HistoryRepository()
         
-        # ✅ ИСПРАВЛЕНИЕ: RLock вместо Lock
-        self.lock = threading.RLock()  # <-- ИЗМЕНЕНО!
+        # RLock для thread-safety (позволяет повторный захват)
+        self.lock = threading.RLock()
         
-        os.makedirs(self.positions_dir, exist_ok=True)
-        self.load_all_positions()
+        # Логируем количество существующих позиций при инициализации
+        positions_count = self.position_repo.get_positions_count()
+        if positions_count > 0:
+            logger.info(f"✅ Найдено открытых позиций: {positions_count}")
+            cryptos = self.position_repo.get_open_cryptos()
+            logger.info(f"📋 Список: {', '.join(cryptos)}")
     
-    def load_all_positions(self) -> None:
-        """Загружает все позиции из директории"""
-        try:
-            if not os.path.exists(self.positions_dir):
-                return
+    def save_position(
+        self,
+        crypto: str,
+        spot_price: float,
+        futures_price: float,
+        spot_qty: float,
+        futures_qty: float,
+        spread_pct: float,
+        add_buys: List[float] = None
+    ) -> bool:
+        """
+        Сохраняет позицию для конкретной криптовалюты.
+        
+        Args:
+            crypto: Символ криптовалюты
+            spot_price: Цена входа на споте
+            futures_price: Цена входа на фьючерсе
+            spot_qty: Количество на споте
+            futures_qty: Количество на фьючерсе
+            spread_pct: Спред при входе (%)
+            add_buys: Список уровней докупок (опционально, пока не используется в БД)
             
-            for filename in os.listdir(self.positions_dir):
-                if filename.endswith('.json'):
-                    filepath = os.path.join(self.positions_dir, filename)
-                    try:
-                        with open(filepath, 'r', encoding='utf-8') as f:
-                            position = json.load(f)
-                            crypto = position.get('crypto')
-                            if crypto:
-                                self.positions[crypto] = position
-                                logger.info(f"[LOAD] Позиция загружена: {crypto}")
-                    except Exception as e:
-                        logger.error(f"Ошибка загрузки {filename}: {e}")
-            
-            if self.positions:
-                logger.info(f"✅ Загружено позиций: {len(self.positions)}")
-        except Exception as e:
-            logger.error(f"Ошибка загрузки позиций: {e}")
-    
-    def save_position(self, crypto: str, spot_price: float, futures_price: float,
-                  spot_qty: float, futures_qty: float, spread_pct: float,
-                  add_buys: List[float] = None) -> bool:
-        """Сохраняет позицию для конкретной криптовалюты"""
+        Returns:
+            bool: True если сохранено успешно
+        """
         if add_buys is None:
             add_buys = []
         
         with self.lock:
-            # Сохраняем существующие данные о фандинге если позиция уже существует
-            existing_position = self.positions.get(crypto, {})
-            
-            position = {
-                "crypto": crypto,
-                "spot_entry_price": spot_price,
-                "futures_entry_price": futures_price,
-                "spot_qty": spot_qty,
-                "futures_qty": futures_qty,
-                "entry_spread_pct": spread_pct,
-                "addition_buy_spreads": add_buys,
-                "entry_timestamp": existing_position.get("entry_timestamp", datetime.now().isoformat()),
-                "target_close_spread_pct": 0.15,
-                # НОВОЕ: отслеживание фандинга
-                "funding_payments_count": existing_position.get("funding_payments_count", 0),
-                "last_funding_check_time": existing_position.get("last_funding_check_time", datetime.now().isoformat()),
-                "low_fr_count": existing_position.get("low_fr_count", 0),  # Счетчик раундов с FR <= 0.005%
-                "consecutive_low_fr": existing_position.get("consecutive_low_fr", False)  # Флаг 2 подряд
-            }
-            
-            self.positions[crypto] = position
-            filename = f"{crypto}.json"
-            filepath = os.path.join(self.positions_dir, filename)
-            
             try:
-                with open(filepath, 'w', encoding='utf-8') as f:
-                    json.dump(position, f, indent=2, ensure_ascii=False)
-                logger.info(f"[SAVE] Позиция сохранена: {crypto}")
+                # Проверяем существует ли позиция
+                existing_position = self.position_repo.get_by_crypto(crypto)
+                
+                if existing_position:
+                    # Обновляем существующую позицию
+                    existing_position.spot_entry_price = spot_price
+                    existing_position.futures_entry_price = futures_price
+                    existing_position.spot_qty = spot_qty
+                    existing_position.futures_qty = futures_qty
+                    existing_position.entry_spread_pct = spread_pct
+                    
+                    self.position_repo.save(existing_position)
+                    logger.info(f"[SAVE] Позиция обновлена: {crypto}")
+                else:
+                    # Создаем новую позицию
+                    position = self.position_repo.create_position(
+                        crypto=crypto,
+                        spot_entry_price=spot_price,
+                        futures_entry_price=futures_price,
+                        spot_qty=spot_qty,
+                        futures_qty=futures_qty,
+                        entry_spread_pct=spread_pct
+                    )
+                    
+                    if not position:
+                        logger.error(f"[SAVE] Не удалось создать позицию {crypto}")
+                        return False
+                    
+                    logger.info(f"[SAVE] Позиция создана: {crypto}")
+                
                 return True
+                
             except Exception as e:
                 logger.error(f"Ошибка сохранения позиции {crypto}: {e}")
                 return False
     
     def increment_funding_count(self, crypto: str, current_fr: float) -> bool:
         """
-        Увеличивает счетчик выплат фандинга и отслеживает низкий FR
+        Увеличивает счетчик выплат фандинга и отслеживает низкий FR.
         
         Args:
-            crypto: символ криптовалюты
-            current_fr: текущий funding rate
-        
+            crypto: Символ криптовалюты
+            current_fr: Текущий funding rate (%)
+            
         Returns:
             bool: True если обновление успешно
         """
         from config import LOW_FR_TRACKING_THRESHOLD, MIN_FUNDING_PAYMENTS_FOR_CLOSE
         
         with self.lock:
-            if crypto not in self.positions:
+            try:
+                # Используем метод репозитория
+                success = self.position_repo.increment_funding_count(
+                    crypto=crypto,
+                    current_fr=current_fr,
+                    low_fr_threshold=LOW_FR_TRACKING_THRESHOLD
+                )
+                
+                if not success:
+                    return False
+                
+                # Проверяем нужно ли активировать мягкий режим
+                position = self.position_repo.get_by_crypto(crypto)
+                if position and position.low_fr_count >= MIN_FUNDING_PAYMENTS_FOR_CLOSE:
+                    if not position.consecutive_low_fr:
+                        self.position_repo.activate_soft_close_mode(crypto)
+                
+                return True
+                
+            except Exception as e:
+                logger.error(f"Ошибка обновления funding {crypto}: {e}")
                 return False
-            
-            position = self.positions[crypto]
-            position['funding_payments_count'] = position.get('funding_payments_count', 0) + 1
-            position['last_funding_check_time'] = datetime.now().isoformat()
-            
-            # Отслеживаем низкий FR
-            if current_fr <= LOW_FR_TRACKING_THRESHOLD:
-                position['low_fr_count'] = position.get('low_fr_count', 0) + 1
-                logger.info(f"[{crypto}] 📉 FR {current_fr:.4f}% <= {LOW_FR_TRACKING_THRESHOLD}%, счетчик низкого FR: {position['low_fr_count']}")
-            else:
-                # FR поднялся выше порога - сбрасываем счетчик
-                position['low_fr_count'] = 0
-                logger.info(f"[{crypto}] 📈 FR {current_fr:.4f}% > {LOW_FR_TRACKING_THRESHOLD}%, счетчик низкого FR сброшен")
-            
-            # Проверяем достигли ли 2 раундов подряд с низким FR
-            if position['low_fr_count'] >= MIN_FUNDING_PAYMENTS_FOR_CLOSE:
-                position['consecutive_low_fr'] = True
-                logger.info(f"[{crypto}] ✅ FR был <= {LOW_FR_TRACKING_THRESHOLD}% в течение {position['low_fr_count']} раундов - активированы мягкие условия закрытия")
-            
-            # Сохраняем обновленную позицию
-            return self._update_position_file(crypto, position)
-    
-    def _update_position_file(self, crypto: str, position: dict) -> bool:
-        """Обновляет файл позиции"""
-        filename = f"{crypto}.json"
-        filepath = os.path.join(self.positions_dir, filename)
-        
-        try:
-            with open(filepath, 'w', encoding='utf-8') as f:
-                json.dump(position, f, indent=2, ensure_ascii=False)
-            return True
-        except Exception as e:
-            logger.error(f"Ошибка обновления позиции {crypto}: {e}")
-            return False
     
     def get_position(self, crypto: str) -> Optional[dict]:
-        """Получает позицию для конкретной криптовалюты"""
+        """
+        Получает позицию для конкретной криптовалюты в формате dict.
+        
+        Args:
+            crypto: Символ криптовалюты
+            
+        Returns:
+            dict | None: Данные позиции или None
+        """
         with self.lock:
-            return self.positions.get(crypto)
+            position = self.position_repo.get_by_crypto(crypto)
+            if position:
+                return position.to_dict()
+            return None
     
     def has_position(self, crypto: str) -> bool:
-        """Проверяет есть ли открытая позиция для криптовалюты"""
+        """
+        Проверяет есть ли открытая позиция для криптовалюты.
+        
+        Args:
+            crypto: Символ криптовалюты
+            
+        Returns:
+            bool: True если позиция существует
+        """
         with self.lock:
-            return crypto in self.positions
+            return self.position_repo.has_position(crypto)
     
     def get_all_positions(self) -> Dict[str, dict]:
-        """Возвращает все открытые позиции"""
+        """
+        Возвращает все открытые позиции в формате dict.
+        
+        Returns:
+            Dict[str, dict]: Словарь {crypto: position_data}
+        """
         with self.lock:
-            return self.positions.copy()
+            positions = self.position_repo.get_all_open()
+            return {pos.crypto: pos.to_dict() for pos in positions}
     
     def get_open_cryptos(self) -> List[str]:
-        """Возвращает список криптовалют с открытыми позициями"""
+        """
+        Возвращает список криптовалют с открытыми позициями.
+        
+        Returns:
+            List[str]: Список символов
+        """
         with self.lock:
-            return list(self.positions.keys())
+            return self.position_repo.get_open_cryptos()
     
     def clear_position(self, crypto: str) -> bool:
-        """Удаляет позицию для конкретной криптовалюты"""
+        """
+        Удаляет позицию для конкретной криптовалюты.
+        
+        Args:
+            crypto: Символ криптовалюты
+            
+        Returns:
+            bool: True если удалено успешно
+        """
         with self.lock:
-            if crypto in self.positions:
-                del self.positions[crypto]
-            
-            filename = f"{crypto}.json"
-            filepath = os.path.join(self.positions_dir, filename)
-            
             try:
-                if os.path.exists(filepath):
-                    os.remove(filepath)
-                logger.info(f"[CLEAR] Позиция очищена: {crypto}")
-                return True
+                success = self.position_repo.delete_by_crypto(crypto)
+                if success:
+                    logger.info(f"[CLEAR] Позиция очищена: {crypto}")
+                return success
             except Exception as e:
                 logger.error(f"Ошибка очистки позиции {crypto}: {e}")
                 return False
     
-    def update_quantities(self, crypto: str, additional_spot_qty: float, 
-                         additional_futures_qty: float) -> bool:
-        """Обновляет количество монет после докупки"""
+    def update_quantities(
+        self,
+        crypto: str,
+        additional_spot_qty: float,
+        additional_futures_qty: float
+    ) -> bool:
+        """
+        Обновляет количество монет после докупки.
+        
+        Args:
+            crypto: Символ криптовалюты
+            additional_spot_qty: Дополнительное количество спот
+            additional_futures_qty: Дополнительное количество фьючерс
+            
+        Returns:
+            bool: True если обновлено успешно
+        """
         with self.lock:
-            if crypto not in self.positions:
-                logger.error(f"Позиция {crypto} не найдена для обновления")
+            try:
+                position = self.position_repo.get_by_crypto(crypto)
+                
+                if not position:
+                    logger.error(f"Позиция {crypto} не найдена для обновления")
+                    return False
+                
+                # Обновляем количество
+                new_spot_qty = position.spot_qty + additional_spot_qty
+                new_futures_qty = position.futures_qty + additional_futures_qty
+                
+                success = self.position_repo.update_position_quantities(
+                    crypto=crypto,
+                    spot_qty=new_spot_qty,
+                    futures_qty=new_futures_qty
+                )
+                
+                if success:
+                    logger.info(
+                        f"[UPDATE] Обновлено qty для {crypto}: "
+                        f"spot={new_spot_qty:.4f}, futures={new_futures_qty:.4f}"
+                    )
+                
+                return success
+                
+            except Exception as e:
+                logger.error(f"Ошибка обновления количества {crypto}: {e}")
                 return False
-            
-            position = self.positions[crypto]
-            position['spot_qty'] += additional_spot_qty
-            position['futures_qty'] += additional_futures_qty
-            
-            # ✅ ТЕПЕРЬ БЕЗОПАСНО: RLock позволяет повторный захват
-            return self.save_position(
-                crypto=crypto,
-                spot_price=position['spot_entry_price'],
-                futures_price=position['futures_entry_price'],
-                spot_qty=position['spot_qty'],
-                futures_qty=position['futures_qty'],
-                spread_pct=position['entry_spread_pct'],
-                add_buys=position.get('addition_buy_spreads', [])
-            )
     
     def add_additional_buy(self, crypto: str, spread_level: float) -> bool:
-        """Добавляет уровень докупки"""
+        """
+        Добавляет уровень докупки.
+        
+        Note: Пока просто логируем, т.к. addition_buy_spreads не в БД модели.
+              Можно добавить позже отдельную таблицу или JSON поле.
+        
+        Args:
+            crypto: Символ криптовалюты
+            spread_level: Уровень спреда докупки
+            
+        Returns:
+            bool: True если добавлено
+        """
         with self.lock:
-            if crypto not in self.positions:
+            if not self.has_position(crypto):
                 return False
             
-            position = self.positions[crypto]
-            
-            if "addition_buy_spreads" not in position:
-                position["addition_buy_spreads"] = []
-            
-            if spread_level not in position["addition_buy_spreads"]:
-                position["addition_buy_spreads"].append(spread_level)
-                
-                # ✅ ТЕПЕРЬ БЕЗОПАСНО: RLock позволяет повторный захват
-                return self.save_position(
-                    crypto=crypto,
-                    spot_price=position['spot_entry_price'],
-                    futures_price=position['futures_entry_price'],
-                    spot_qty=position['spot_qty'],
-                    futures_qty=position['futures_qty'],
-                    spread_pct=position['entry_spread_pct'],
-                    add_buys=position["addition_buy_spreads"]
-                )
-            
+            logger.info(f"[{crypto}] Докупка на уровне спреда: {spread_level:.2f}%")
+            # TODO: Добавить таблицу additional_buys если потребуется
             return True
     
     def get_positions_count(self) -> int:
-        """Возвращает количество открытых позиций"""
+        """
+        Возвращает количество открытых позиций.
+        
+        Returns:
+            int: Количество позиций
+        """
         with self.lock:
-            return len(self.positions)
+            return self.position_repo.get_positions_count()
     
     def close_position_with_pnl(
         self,
@@ -241,137 +304,136 @@ class MultiPositionManager:
         close_futures_price: float
     ) -> Optional[dict]:
         """
-        Закрывает позицию, считает PnL с учетом РЕАЛЬНОГО фандинга и сохраняет в историю.
+        Закрывает позицию, считает PnL с учетом реального фандинга и сохраняет в историю.
+        
+        Args:
+            crypto: Символ криптовалюты
+            close_spot_price: Цена закрытия спот
+            close_futures_price: Цена закрытия фьючерс
+            
+        Returns:
+            dict | None: PnL данные или None при ошибке
         """
+        from calculators.pnl_calculator import PnLCalculator
+        from calculators.funding_calculator import RealizedFundingCalculator
+        from config import COMMISSION_PCT
+        
         with self.lock:
-            if crypto not in self.positions:
-                logger.error(f"Позиция {crypto} не найдена для закрытия")
-                return None
-            
-            position = self.positions[crypto]
-            
-            # 1. Импорты
-            from calculators.pnl_calculator import PnLCalculator
-            from calculators.funding_calculator import RealizedFundingCalculator
-            from config import COMMISSION_PCT
-            
-            # 2. 🆕 РАСЧЕТ РЕАЛЬНОГО ФАНДИНГА через API
-            entry_timestamp = position.get("entry_timestamp")
-            logger.info(f"[{crypto}] 💰 Рассчитываем накопленный фандинг с момента открытия...")
-            
             try:
-                accumulated_funding = RealizedFundingCalculator.get_accumulated_funding(
-                    crypto=crypto,
-                    start_time_iso=entry_timestamp,
-                    end_time_iso=None  # До текущего момента
-                )
+                # Получаем позицию из БД
+                position = self.position_repo.get_by_crypto(crypto)
                 
-                if accumulated_funding is None:
-                    logger.error(f"[{crypto}] ❌ Не удалось получить данные фандинга!")
-                    logger.warning(f"[{crypto}] ⚠️ PnL будет рассчитан БЕЗ учета фандинга")
+                if not position:
+                    logger.error(f"Позиция {crypto} не найдена для закрытия")
+                    return None
+                
+                # 1. Расчет реального фандинга через API
+                entry_timestamp = position.entry_timestamp.isoformat()
+                logger.info(f"[{crypto}] 💰 Рассчитываем накопленный фандинг с момента открытия...")
+                
+                try:
+                    accumulated_funding = RealizedFundingCalculator.get_accumulated_funding(
+                        crypto=crypto,
+                        start_time_iso=entry_timestamp,
+                        end_time_iso=None  # До текущего момента
+                    )
+                    
+                    if accumulated_funding is None:
+                        logger.error(f"[{crypto}] ❌ Не удалось получить данные фандинга!")
+                        logger.warning(f"[{crypto}] ⚠️ PnL будет рассчитан БЕЗ учета фандинга")
+                        accumulated_funding = 0.0
+                        funding_error = True
+                    else:
+                        logger.info(f"[{crypto}] ✅ Накопленный фандинг: {accumulated_funding:.4f} USDT")
+                        funding_error = False
+                        
+                except Exception as e:
+                    logger.error(f"[{crypto}] ❌ Ошибка расчета фандинга: {e}")
                     accumulated_funding = 0.0
                     funding_error = True
-                else:
-                    logger.info(f"[{crypto}] ✅ Накопленный фандинг: {accumulated_funding:.4f} USDT")
-                    funding_error = False
-                    
-            except Exception as e:
-                logger.error(f"[{crypto}] ❌ Ошибка расчета фандинга: {e}")
-                accumulated_funding = 0.0
-                funding_error = True
-            
-            # 3. Комиссия: 0.2% -> 0.002
-            commission_rate = COMMISSION_PCT / 100.0
-            
-            # 4. 🆕 ПРАВИЛЬНЫЙ РАСЧЕТ PnL ДЛЯ АРБИТРАЖА
-            pnl_result = PnLCalculator.calculate_pnl(
-                spot_entry_price=position["spot_entry_price"],
-                spot_exit_price=close_spot_price,
-                futures_entry_price=position["futures_entry_price"],
-                futures_exit_price=close_futures_price,
-                spot_qty=position["spot_qty"],
-                futures_qty=position["futures_qty"],
-                commission_rate=commission_rate,
-                total_funding_received=accumulated_funding
-            )
-            
-            # 5. Расчет изменения спреда
-            spread_info = PnLCalculator.calculate_spread_change(
-                entry_spread_pct=position.get("entry_spread_pct", 0),
-                close_spread_pct=(close_futures_price - close_spot_price) / close_spot_price * 100
-            )
-            
-            # 6. Формирование записи для истории
-            closed_position = {
-                "crypto": crypto,
-                "entry_time": entry_timestamp,
-                "close_time": datetime.now().isoformat(),
-                "spot_entry_price": position["spot_entry_price"],
-                "futures_entry_price": position["futures_entry_price"],
-                "spot_close_price": close_spot_price,
-                "futures_close_price": close_futures_price,
-                "spot_qty": position["spot_qty"],
-                "futures_qty": position["futures_qty"],
-                "entry_spread_pct": position.get("entry_spread_pct", 0),
-                "close_spread_pct": (close_futures_price - close_spot_price) / close_spot_price * 100,
-                "spread_change": spread_info["spread_change"],
-                "spread_direction": spread_info["spread_direction"],
-                "funding_payments_count": position.get("funding_payments_count", 0),
-                "accumulated_funding": accumulated_funding,
-                "funding_error": funding_error,  # 🆕 Флаг ошибки фандинга
-                "pnl": pnl_result
-            }
-            
-            # 7. Сохранение и очистка
-            self._save_closed_position(closed_position)
-            
-            # 8. 🆕 УЛУЧШЕННЫЙ ЛОГ с детальной разбивкой
-            logger.info("="*70)
-            logger.info(f"💰 ЗАКРЫТА ПОЗИЦИЯ: {crypto}")
-            logger.info("="*70)
-            logger.info(f"📊 ЦЕНЫ:")
-            logger.info(f"   Спот:     {position['spot_entry_price']:.6f} → {close_spot_price:.6f} "
-                    f"({((close_spot_price/position['spot_entry_price']-1)*100):+.2f}%)")
-            logger.info(f"   Фьючерс:  {position['futures_entry_price']:.6f} → {close_futures_price:.6f} "
-                    f"({((close_futures_price/position['futures_entry_price']-1)*100):+.2f}%)")
-            logger.info(f"")
-            logger.info(f"📈 СПРЕД:")
-            logger.info(f"   Вход:     {position.get('entry_spread_pct', 0):.4f}%")
-            logger.info(f"   Выход:    {closed_position['close_spread_pct']:.4f}%")
-            logger.info(f"   Изменение: {spread_info['spread_change']:+.4f}% ({spread_info['spread_direction']})")
-            logger.info(f"")
-            logger.info(f"💵 PnL BREAKDOWN:")
-            logger.info(f"   ├─ Спот PnL:      {pnl_result['spot_pnl']:+.4f} USDT")
-            logger.info(f"   ├─ Фьючерс PnL:   {pnl_result['futures_pnl']:+.4f} USDT")
-            logger.info(f"   ├─ Price PnL:     {pnl_result['price_pnl']:+.4f} USDT")
-            
-            if funding_error:
-                logger.warning(f"   ├─ Funding:       ⚠️ ОШИБКА РАСЧЕТА")
-            else:
-                logger.info(f"   ├─ Funding:       {pnl_result['funding']:+.4f} USDT")
-            
-            logger.info(f"   ├─ Commission:    -{pnl_result['commission']:.4f} USDT")
-            logger.info(f"   └─ NET PnL:       {pnl_result['net_pnl']:+.4f} USDT {'✅' if pnl_result['net_pnl'] > 0 else '❌'}")
-            logger.info("="*70)
-            
-            # Удаляем открытую позицию (и файл json)
-            self.clear_position(crypto)
-            
-            return pnl_result
-
-    def _save_closed_position(self, closed_position: dict) -> None:
-        """Сохраняет закрытую позицию в общий файл истории (append)"""
-        history_file = os.path.join(self.positions_dir, "closed_positions_history.json")
-        try:
-            history = []
-            if os.path.exists(history_file):
-                with open(history_file, "r", encoding="utf-8") as f:
-                    history = json.load(f)
-            
-            history.append(closed_position)
-            
-            with open(history_file, "w", encoding="utf-8") as f:
-                json.dump(history, f, indent=2, ensure_ascii=False)
                 
-        except Exception as e:
-            logger.error(f"Ошибка сохранения истории позиций: {e}")
+                # 2. Комиссия
+                commission_rate = COMMISSION_PCT / 100.0
+                
+                # 3. Расчет PnL
+                pnl_result = PnLCalculator.calculate_pnl(
+                    spot_entry_price=position.spot_entry_price,
+                    spot_exit_price=close_spot_price,
+                    futures_entry_price=position.futures_entry_price,
+                    futures_exit_price=close_futures_price,
+                    spot_qty=position.spot_qty,
+                    futures_qty=position.futures_qty,
+                    commission_rate=commission_rate,
+                    total_funding_received=accumulated_funding
+                )
+                
+                # 4. Расчет изменения спреда
+                close_spread_pct = (close_futures_price - close_spot_price) / close_spot_price * 100
+                spread_info = PnLCalculator.calculate_spread_change(
+                    entry_spread_pct=position.entry_spread_pct,
+                    close_spread_pct=close_spread_pct
+                )
+                
+                # 5. Сохранение в историю через репозиторий
+                close_timestamp = datetime.now()
+                
+                self.history_repo.save_closed_position(
+                    crypto=crypto,
+                    entry_timestamp=position.entry_timestamp,
+                    close_timestamp=close_timestamp,
+                    spot_entry_price=position.spot_entry_price,
+                    futures_entry_price=position.futures_entry_price,
+                    spot_exit_price=close_spot_price,
+                    futures_exit_price=close_futures_price,
+                    spot_qty=position.spot_qty,
+                    futures_qty=position.futures_qty,
+                    entry_spread_pct=position.entry_spread_pct,
+                    close_spread_pct=close_spread_pct,
+                    pnl_data=pnl_result,
+                    funding_payments_count=position.funding_payments_count
+                )
+                
+                # 6. Детальный лог
+                logger.info("=" * 70)
+                logger.info(f"💰 ЗАКРЫТА ПОЗИЦИЯ: {crypto}")
+                logger.info("=" * 70)
+                logger.info(f"📊 ЦЕНЫ:")
+                logger.info(
+                    f"   Спот: {position.spot_entry_price:.6f} → {close_spot_price:.6f} "
+                    f"({((close_spot_price/position.spot_entry_price-1)*100):+.2f}%)"
+                )
+                logger.info(
+                    f"   Фьючерс: {position.futures_entry_price:.6f} → {close_futures_price:.6f} "
+                    f"({((close_futures_price/position.futures_entry_price-1)*100):+.2f}%)"
+                )
+                logger.info(f"")
+                logger.info(f"📈 СПРЕД:")
+                logger.info(f"   Вход: {position.entry_spread_pct:.4f}%")
+                logger.info(f"   Выход: {close_spread_pct:.4f}%")
+                logger.info(f"   Изменение: {spread_info['spread_change']:+.4f}% ({spread_info['spread_direction']})")
+                logger.info(f"")
+                logger.info(f"💵 PnL BREAKDOWN:")
+                logger.info(f"   ├─ Спот PnL: {pnl_result['spot_pnl']:+.4f} USDT")
+                logger.info(f"   ├─ Фьючерс PnL: {pnl_result['futures_pnl']:+.4f} USDT")
+                logger.info(f"   ├─ Price PnL: {pnl_result['price_pnl']:+.4f} USDT")
+                
+                if funding_error:
+                    logger.warning(f"   ├─ Funding: ⚠️ ОШИБКА РАСЧЕТА")
+                else:
+                    logger.info(f"   ├─ Funding: {pnl_result['funding']:+.4f} USDT")
+                
+                logger.info(f"   ├─ Commission: -{pnl_result['commission']:.4f} USDT")
+                logger.info(
+                    f"   └─ NET PnL: {pnl_result['net_pnl']:+.4f} USDT "
+                    f"{'✅' if pnl_result['net_pnl'] > 0 else '❌'}"
+                )
+                logger.info("=" * 70)
+                
+                # 7. Удаляем открытую позицию из БД
+                self.clear_position(crypto)
+                
+                return pnl_result
+                
+            except Exception as e:
+                logger.error(f"Ошибка закрытия позиции {crypto}: {e}", exc_info=True)
+                return None
