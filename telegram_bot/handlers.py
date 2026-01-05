@@ -228,7 +228,7 @@ class CommandHandlers:
 
         try:
             # Получение всех записей blacklist с деталями
-            blacklist_details = self.blacklist_repo.get_all_details()
+            blacklist_details = self.blacklist_repo.get_all()
 
             if not blacklist_details:
                 message = "🚫 *BLACKLIST*\n\n✅ Нет заблокированных пар"
