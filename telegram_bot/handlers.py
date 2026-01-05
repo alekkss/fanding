@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
+
 """
 Обработчики команд Telegram бота.
-Обрабатывает базовые команды: /start, /status, /positions, /stats.
+Обрабатывает базовые команды: /start, /status, /positions, /stats, /blacklist.
 """
 
 import logging
 from typing import Optional
 from datetime import datetime
-
 from telegram import Update
 from telegram.ext import ContextTypes
 
@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 class CommandHandlers:
     """
     Обработчики команд Telegram бота.
-
+    
     Single Responsibility: только обработка команд пользователя.
     Dependency Injection: получает репозитории через конструктор.
     """
@@ -36,7 +36,7 @@ class CommandHandlers:
     ):
         """
         Инициализация обработчиков.
-
+        
         Args:
             position_repo: Репозиторий позиций
             history_repo: Репозиторий истории
@@ -46,16 +46,15 @@ class CommandHandlers:
         self.history_repo = history_repo or HistoryRepository()
         self.blacklist_repo = blacklist_repo or BlacklistRepository()
         self.formatter = MessageFormatter()
-
         logger.info("✅ CommandHandlers инициализирован")
 
     def _check_admin(self, update: Update) -> bool:
         """
         Проверяет права администратора.
-
+        
         Args:
             update: Telegram Update объект
-
+            
         Returns:
             bool: True если пользователь админ
         """
@@ -71,12 +70,10 @@ class CommandHandlers:
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """
         Обработчик команды /start.
-
         Показывает приветствие и chat_id для первичной настройки.
         """
         user = update.effective_user
         chat_id = update.effective_chat.id
-
         logger.info(f"📱 /start от {user.username} (chat_id={chat_id})")
 
         # Проверка прав
@@ -88,10 +85,10 @@ class CommandHandlers:
 🤖 Я бот для мониторинга арбитражного бота Bybit.
 
 *Доступные команды:*
-
 📊 */status* - текущее состояние системы
 📍 */positions* - список открытых позиций
 📈 */stats* - статистика торговли
+🚫 */blacklist* - список заблокированных пар
 
 ✅ Ты авторизован как администратор.
 """
@@ -112,7 +109,6 @@ class CommandHandlers:
     async def status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """
         Обработчик команды /status.
-
         Показывает текущее состояние системы: открытые позиции, blacklist.
         """
         chat_id = update.effective_chat.id
@@ -154,7 +150,6 @@ class CommandHandlers:
     async def positions(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """
         Обработчик команды /positions.
-
         Показывает список открытых позиций с деталями.
         """
         chat_id = update.effective_chat.id
@@ -188,7 +183,6 @@ class CommandHandlers:
     async def stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """
         Обработчик команды /stats.
-
         Показывает статистику торговли: total PnL, win rate, avg PnL.
         """
         chat_id = update.effective_chat.id
@@ -216,10 +210,100 @@ class CommandHandlers:
                 parse_mode='Markdown'
             )
 
+    async def blacklist(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """
+        Обработчик команды /blacklist.
+        Показывает список всех заблокированных криптовалют с причинами и кодами ошибок.
+        """
+        chat_id = update.effective_chat.id
+        logger.info(f"📱 /blacklist от chat_id={chat_id}")
+
+        # Проверка прав
+        if not self._check_admin(update):
+            await update.message.reply_text(
+                "⛔ Доступ запрещен. Используй /start для получения chat_id.",
+                parse_mode='Markdown'
+            )
+            return
+
+        try:
+            # Получение всех записей blacklist с деталями
+            blacklist_details = self.blacklist_repo.get_all_details()
+
+            if not blacklist_details:
+                message = "🚫 *BLACKLIST*\n\n✅ Нет заблокированных пар"
+                await update.message.reply_text(message, parse_mode='Markdown')
+                return
+
+            # Формирование сообщения
+            message_lines = [f"🚫 *BLACKLIST* ({len(blacklist_details)} пар)\n"]
+
+            for idx, entry in enumerate(blacklist_details, 1):
+                crypto = entry.crypto
+                reason = entry.reason or "Не указана"
+                error_code = entry.error_code
+                timestamp = entry.timestamp.strftime("%d.%m %H:%M") if entry.timestamp else "N/A"
+
+                # Форматирование записи
+                entry_text = f"{idx}. *{crypto}*\n"
+                entry_text += f"├─ 📝 {reason}\n"
+                
+                if error_code:
+                    entry_text += f"├─ 🔢 Код ошибки: `{error_code}`\n"
+                
+                entry_text += f"└─ 📅 {timestamp}\n"
+
+                message_lines.append(entry_text)
+
+            message = "\n".join(message_lines)
+
+            # Telegram ограничивает длину сообщения 4096 символов
+            if len(message) > 4096:
+                # Разбиваем на несколько сообщений
+                parts = []
+                current_part = f"🚫 *BLACKLIST* ({len(blacklist_details)} пар)\n\n"
+                
+                for idx, entry in enumerate(blacklist_details, 1):
+                    crypto = entry.crypto
+                    reason = entry.reason or "Не указана"
+                    error_code = entry.error_code
+                    timestamp = entry.timestamp.strftime("%d.%m %H:%M") if entry.timestamp else "N/A"
+
+                    entry_text = f"{idx}. *{crypto}*\n"
+                    entry_text += f"├─ 📝 {reason}\n"
+                    
+                    if error_code:
+                        entry_text += f"├─ 🔢 Код: `{error_code}`\n"
+                    
+                    entry_text += f"└─ 📅 {timestamp}\n\n"
+
+                    # Проверка длины
+                    if len(current_part) + len(entry_text) > 4000:
+                        parts.append(current_part)
+                        current_part = entry_text
+                    else:
+                        current_part += entry_text
+
+                # Добавляем последнюю часть
+                if current_part:
+                    parts.append(current_part)
+
+                # Отправляем по частям
+                for part in parts:
+                    await update.message.reply_text(part, parse_mode='Markdown')
+            else:
+                await update.message.reply_text(message, parse_mode='Markdown')
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения blacklist: {e}", exc_info=True)
+            await update.message.reply_text(
+                "❌ Ошибка получения blacklist. Проверь логи.",
+                parse_mode='Markdown'
+            )
+
     async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """
         Глобальный обработчик ошибок.
-
         Логирует все необработанные ошибки в handlers.
         """
         logger.error(f"❌ Ошибка в обработчике команды: {context.error}", exc_info=context.error)
