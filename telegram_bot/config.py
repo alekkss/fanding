@@ -21,8 +21,7 @@ class TelegramConfig:
     
     # Токен бота (из переменной окружения или значение по умолчанию)
     BOT_TOKEN: str = os.getenv(
-        "TELEGRAM_BOT_TOKEN",
-        "7534003941:AAEib2A0V-aY1ohtj7yam5Wm6_7U1hU5HAA"
+        "TELEGRAM_BOT_TOKEN"
     )
     
     # Whitelist разрешенных chat_id (добавь свой после первого /start)
