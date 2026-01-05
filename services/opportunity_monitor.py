@@ -13,6 +13,7 @@ from managers.leverage_manager import LeverageManager
 from services.order_executor import OrderExecutor
 from managers.blacklist_manager import blacklist_manager
 from managers.balance import get_coin_balance
+from integration.telegram_integration import get_telegram_integration
 from config import (
     MIN_FUNDING_RATE, MIN_PROFIT_PCT, COMMISSION_PCT,
     MIN_ENTRY_SPREAD_PCT, CLOSE_FR_THRESHOLD,
@@ -144,6 +145,28 @@ class OpportunityMonitor:
                     )
                     
                     logger.info(f"[{crypto}] ✅ Позиция успешно закрыта, PnL сохранен")
+                    # 🆕 ДОБАВИТЬ после:
+                    # Telegram уведомление о закрытии
+                    telegram = get_telegram_integration()
+                    if telegram:
+                        closed_pos = position_manager.get_position(crypto)
+                        if not closed_pos:  # Позиция уже удалена, получаем из истории
+                            from database.repositories.history_repository import HistoryRepository
+                            hist_repo = HistoryRepository()
+                            history = hist_repo.get_history_by_crypto(crypto)
+                            if history:
+                                last_closed = history[-1]
+                                telegram.notify_position_closed(
+                                    crypto=crypto,
+                                    entry_time=last_closed.entry_timestamp.isoformat(),
+                                    close_time=last_closed.close_timestamp.isoformat(),
+                                    spot_pnl=last_closed.spot_pnl,
+                                    futures_pnl=last_closed.futures_pnl,
+                                    funding=last_closed.funding_pnl,
+                                    commission=last_closed.commission,
+                                    net_pnl=last_closed.net_pnl
+                                )
+
                     return True
                 else:
                     logger.error(f"[{crypto}] Ошибка закрытия позиции, повтор через {MONITOR_INTERVAL_SEC} сек")
@@ -281,6 +304,15 @@ class OpportunityMonitor:
                                         error_code=error_code
                                     )
                                     logger.warning(f"[{crypto}] 🚫 Добавлен в blacklist")
+                                    # 🆕 ДОБАВИТЬ:
+                                    # Telegram уведомление о blacklist
+                                    telegram = get_telegram_integration()
+                                    if telegram:
+                                        telegram.notify_blacklist_added(
+                                            crypto=crypto,
+                                            reason=f"Futures error: {error_str}",  # Та же причина что в blacklist_manager
+                                            error_code=error_code
+                                        )
                             except (ValueError, IndexError):
                                 pass
                     
@@ -325,6 +357,18 @@ class OpportunityMonitor:
                     )
                     
                     logger.info(f"[{crypto}] 💾 Позиция сохранена и будет мониториться")
+                    # 🆕 ДОБАВИТЬ после:
+                    # Telegram уведомление об открытии
+                    telegram = get_telegram_integration()
+                    if telegram:
+                        telegram.notify_position_opened(
+                            crypto=crypto,
+                            spot_entry_price=spot_ask,
+                            futures_entry_price=futures_bid,
+                            spot_qty=purchased_qty,
+                            entry_spread_pct=spread_pct,
+                            funding_rate=funding_rate
+                        )
                     return True
                     
                 else:
@@ -335,6 +379,17 @@ class OpportunityMonitor:
                     logger.critical(f"[{crypto}] Ошибка спота: {spot_result['error']}")
                     logger.critical(f"[{crypto}] 🔴 НЕОБХОДИМО ВРУЧНУЮ ЗАКРЫТЬ ФЬЮЧЕРС!")
                     logger.critical(f"[{crypto}] Параметры для ручного закрытия: qty={futures_result['qty']} {crypto}")
+
+                    # 🆕 ДОБАВИТЬ после:
+                    # Telegram уведомление о критической ошибке
+                    telegram = get_telegram_integration()
+                    if telegram:
+                        telegram.notify_critical_error(
+                            error_type='futures_opened_spot_failed',
+                            message=f"Спот ошибка: {spot_result['error']}",
+                            crypto=crypto,
+                            qty=futures_result['qty']
+                        )
                     
                     # Проверяем нужно ли добавить в blacklist
                     if spot_result.get('error'):
@@ -350,6 +405,15 @@ class OpportunityMonitor:
                                         error_code=error_code
                                     )
                                     logger.warning(f"[{crypto}] 🚫 Добавлен в blacklist")
+                                    # 🆕 ДОБАВИТЬ:
+                                    # Telegram уведомление о blacklist
+                                    telegram = get_telegram_integration()
+                                    if telegram:
+                                        telegram.notify_blacklist_added(
+                                            crypto=crypto,
+                                            reason=f"Spot error after futures opened: {error_str}",  # Та же причина что в blacklist_manager
+                                            error_code=error_code
+                                        )
                             except (ValueError, IndexError):
                                 pass
                     
