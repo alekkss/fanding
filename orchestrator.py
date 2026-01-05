@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-
 """Оркестратор с поддержкой множественных позиций и работой с БД"""
 
 import logging
@@ -26,20 +25,21 @@ from database.repositories.position_repository import PositionRepository
 from database.repositories.history_repository import HistoryRepository
 from database.repositories.blacklist_repository import BlacklistRepository
 
+# 🆕 Импорт Telegram интеграции
+from integration.telegram_integration import initialize_telegram_integration
+
 logger = setup_logging()
 
 
 class MultiCryptoOrchestrator:
     """
     Оркестратор для торговли несколькими криптовалютами одновременно.
-    
     Обновленная версия с использованием Repository Pattern и БД.
     """
     
     def __init__(self):
         """
         Инициализация оркестратора с репозиториями и менеджерами.
-        
         Применяет Dependency Injection для всех компонентов.
         """
         logger.info("🔧 Инициализация оркестратора...")
@@ -67,6 +67,18 @@ class MultiCryptoOrchestrator:
             blacklist_repo=self.blacklist_repo
         )
         
+        # 🆕 Инициализация Telegram интеграции
+        try:
+            self.telegram = initialize_telegram_integration(
+                position_repo=self.position_repo,
+                history_repo=self.history_repo,
+                blacklist_repo=self.blacklist_repo
+            )
+            logger.info("✅ Telegram интеграция инициализирована")
+        except Exception as e:
+            logger.warning(f"⚠️ Не удалось инициализировать Telegram: {e}")
+            self.telegram = None
+        
         # Управление потоками
         self.active_threads: Set[str] = set()
         self.lock = threading.Lock()
@@ -86,7 +98,6 @@ class MultiCryptoOrchestrator:
             
             while not self.shutdown_event.is_set():
                 position = self.position_manager.get_position(crypto)
-                
                 if not position:
                     logger.warning(f"[{crypto}] Позиция исчезла, завершаем мониторинг")
                     break
@@ -165,7 +176,6 @@ class MultiCryptoOrchestrator:
         
         for crypto in open_positions:
             position = self.position_manager.get_position(crypto)
-            
             if not position:
                 logger.warning(f"[{crypto}] Позиция в списке, но не найдена в менеджере")
                 continue
@@ -202,7 +212,6 @@ class MultiCryptoOrchestrator:
         try:
             open_positions = self.position_manager.get_open_cryptos()
             open_count = len(open_positions)
-            
             logger.info(f"📊 Открытых позиций: {open_count}/{MAX_CONCURRENT_POSITIONS}")
             
             if open_count >= MAX_CONCURRENT_POSITIONS:
@@ -304,8 +313,8 @@ class MultiCryptoOrchestrator:
                     daemon=True
                 )
                 open_thread.start()
-                
                 logger.info(f"[{crypto}] 🚀 Запущен поток открытия позиции")
+                
                 time.sleep(2)  # Задержка между запуском потоков
                 
         except Exception as e:
@@ -319,6 +328,13 @@ class MultiCryptoOrchestrator:
         logger.info(f"⏱️ Интервал сканирования: {SCAN_INTERVAL_SEC}s")
         logger.info(f"💾 База данных: SQLite (arbitrage.db)")
         logger.info("=" * 60)
+        
+        # 🆕 Запуск Telegram бота
+        if self.telegram:
+            if self.telegram.start():
+                logger.info("✅ Telegram бот запущен")
+            else:
+                logger.warning("⚠️ Не удалось запустить Telegram бота")
         
         # Восстанавливаем мониторинг существующих позиций
         self.restore_monitoring()
@@ -336,6 +352,7 @@ class MultiCryptoOrchestrator:
                     logger.info("👋 Получен сигнал остановки (Ctrl+C)")
                     self.shutdown()
                     break
+                    
                 except Exception as e:
                     logger.error(f"❌ Ошибка в главном цикле: {e}", exc_info=True)
                     time.sleep(30)
@@ -347,13 +364,17 @@ class MultiCryptoOrchestrator:
         logger.info("🛑 Инициирована остановка...")
         self.shutdown_event.set()
         
+        # 🆕 Остановка Telegram бота
+        if self.telegram:
+            self.telegram.stop()
+            logger.info("✅ Telegram бот остановлен")
+        
         # Ждем завершения активных потоков
         for i in range(30):
             with self.lock:
                 active_count = len(self.active_threads)
-                if active_count == 0:
-                    break
-            
+            if active_count == 0:
+                break
             logger.info(f"⏳ Ожидание завершения {active_count} потоков...")
             time.sleep(1)
         
