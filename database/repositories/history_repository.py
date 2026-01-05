@@ -308,6 +308,16 @@ class HistoryRepository(BaseRepository[ClosedPosition]):
             logger.error(f"[HISTORY REPO] Ошибка расчета статистики: {e}")
             return self._empty_statistics()
     
+    def get_statistics(self) -> Dict[str, Any]:
+        """
+        Алиас для calculate_statistics().
+        Используется в Telegram handlers.
+        
+        Returns:
+            Dict: Статистика торговли
+        """
+        return self.calculate_statistics()
+    
     def get_profitable_cryptos(self, min_trades: int = 3) -> List[Dict[str, Any]]:
         """
         Получить список криптовалют с положительным PnL.
@@ -372,3 +382,4 @@ class HistoryRepository(BaseRepository[ClosedPosition]):
             "best_trade": 0.0,
             "worst_trade": 0.0
         }
+    

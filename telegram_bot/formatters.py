@@ -5,7 +5,7 @@
 """
 
 from datetime import datetime
-from typing import Dict, Any
+from typing import List, Dict, Any
 
 
 class MessageFormatter:
@@ -269,32 +269,58 @@ _Детали:_ {message_text}
         return message
     
     @staticmethod
-    def format_positions_list(positions: list) -> str:
+    def format_positions_list(positions: List[Dict[str, Any]]) -> str:
         """
         Форматирует список открытых позиций.
         
         Args:
-            positions: Список словарей с данными позиций
-                
+            positions: Список позиций из PositionRepository (словари)
+            
         Returns:
-            str: Отформатированное сообщение
+            str: Форматированное сообщение
         """
         if not positions:
-            return "📍 *ОТКРЫТЫЕ ПОЗИЦИИ*\n\n_Нет открытых позиций_"
+            return "📍 Нет открытых позиций"
         
-        message = f"📍 *ОТКРЫТЫЕ ПОЗИЦИИ* ({len(positions)})\n\n"
+        lines = [f"📍 ОТКРЫТЫЕ ПОЗИЦИИ ({len(positions)})\n"]
         
         for idx, pos in enumerate(positions, 1):
-            crypto = pos.get('crypto', 'UNKNOWN')
-            spot_price = pos.get('spot_entry_price', 0)
-            futures_price = pos.get('futures_entry_price', 0)
-            spread = pos.get('entry_spread_pct', 0)
-            qty = pos.get('spot_qty', 0)
+            crypto = pos.get('crypto', 'N/A')
             
-            message += f"*{idx}. {crypto}*\n"
-            message += f"├─ Спот: `{spot_price:,.2f}` USDT\n"
-            message += f"├─ Фьючерс: `{futures_price:,.2f}` USDT\n"
-            message += f"├─ Спред: `{spread:.2f}%`\n"
-            message += f"└─ Qty: `{qty:.4f}`\n\n"
+            # Парсим время входа
+            try:
+                entry_timestamp = pos.get('entry_timestamp', '')
+                entry_time = datetime.fromisoformat(entry_timestamp)
+                time_str = entry_time.strftime("%d.%m %H:%M")
+            except:
+                time_str = "N/A"
+            
+            # Рассчитываем текущее время в позиции
+            try:
+                entry_timestamp = pos.get('entry_timestamp', '')
+                entry_dt = datetime.fromisoformat(entry_timestamp)
+                now = datetime.now()
+                duration = now - entry_dt
+                hours = int(duration.total_seconds() // 3600)
+                minutes = int((duration.total_seconds() % 3600) // 60)
+                duration_str = f"{hours}ч {minutes}мин"
+            except:
+                duration_str = "N/A"
+            
+            spot_price = pos.get('spot_entry_price', 0.0)
+            futures_price = pos.get('futures_entry_price', 0.0)
+            spot_qty = pos.get('spot_qty', 0.0)
+            futures_qty = pos.get('futures_qty', 0.0)
+            spread = pos.get('entry_spread_pct', 0.0)
+            
+            lines.append(f"{idx}. {crypto}")
+            lines.append(f"├─ Вход: {time_str} ({duration_str} назад)")
+            lines.append(f"├─ Спот: {spot_price:.6f} USDT (qty: {spot_qty:.4f})")
+            lines.append(f"├─ Фьючерс: {futures_price:.6f} USDT (qty: {futures_qty:.4f})")
+            lines.append(f"└─ Спред: {spread:.2f}%")
+            
+            # Добавляем пустую строку между позициями (кроме последней)
+            if idx < len(positions):
+                lines.append("")
         
-        return message.strip()
+        return "\n".join(lines)

@@ -6,6 +6,7 @@
 
 import logging
 import threading
+import asyncio
 from typing import Optional
 
 from telegram.ext import Application, CommandHandler
@@ -42,7 +43,9 @@ class TelegramBot:
             blacklist_repo: Репозиторий blacklist
         """
         self.config = telegram_config
+
         
+            
         # Репозитории (DI)
         self.position_repo = position_repo or PositionRepository()
         self.history_repo = history_repo or HistoryRepository()
@@ -61,6 +64,11 @@ class TelegramBot:
         # Поток для запуска бота
         self.bot_thread: Optional[threading.Thread] = None
         self.running = False
+
+        # Отключаем HTTP логи
+        import logging
+        logging.getLogger('httpx').setLevel(logging.WARNING)
+        logging.getLogger('telegram').setLevel(logging.WARNING)
         
         logger.info("✅ TelegramBot инициализирован")
     
@@ -99,18 +107,45 @@ class TelegramBot:
         
         Блокирующий вызов - используется в отдельном потоке.
         """
+        # Создаем новый event loop для этого потока
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
         try:
             logger.info("🚀 Запуск Telegram Bot polling...")
             
-            # Запуск polling (блокирующий вызов)
-            self.application.run_polling(
-                allowed_updates=["message", "callback_query"],
-                drop_pending_updates=True
+            # Инициализация Application
+            loop.run_until_complete(self.application.initialize())
+            loop.run_until_complete(self.application.start())
+            
+            # Запуск polling без signal handlers
+            loop.run_until_complete(
+                self.application.updater.start_polling(
+                    allowed_updates=["message", "callback_query"],
+                    drop_pending_updates=True
+                )
             )
+            
+            logger.info("✅ Telegram Bot polling запущен")
+            
+            # Бесконечный цикл - держим бота живым
+            while self.running:
+                loop.run_until_complete(asyncio.sleep(1))
+            
+            logger.info("🛑 Остановка polling...")
+            
+            # Останавливаем polling
+            loop.run_until_complete(self.application.updater.stop())
+            loop.run_until_complete(self.application.stop())
+            loop.run_until_complete(self.application.shutdown())
             
         except Exception as e:
             logger.error(f"❌ Ошибка в Telegram Bot polling: {e}", exc_info=True)
         finally:
+            try:
+                loop.close()
+            except:
+                pass
             self.running = False
             logger.info("🛑 Telegram Bot polling остановлен")
     
@@ -160,15 +195,12 @@ class TelegramBot:
         try:
             logger.info("🛑 Остановка Telegram Bot...")
             
-            # Остановка Application
-            if self.application:
-                self.application.stop()
-            
+            # Устанавливаем флаг остановки
             self.running = False
             
             # Ожидание завершения потока
             if self.bot_thread and self.bot_thread.is_alive():
-                self.bot_thread.join(timeout=5)
+                self.bot_thread.join(timeout=10)
             
             logger.info("✅ Telegram Bot остановлен")
             

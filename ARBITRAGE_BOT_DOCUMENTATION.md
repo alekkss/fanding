@@ -11,6 +11,7 @@
 - **Storage**: SQLite база данных (SQLAlchemy ORM)
 - **Migrations**: Alembic для управления схемой БД
 - **Design Pattern**: Repository Pattern + Dependency Injection
+- **Notifications**: Telegram Bot (python-telegram-bot v20+)
 - **Logging**: Структурированное логирование с уровнями
 
 ## Структура проекта
@@ -18,31 +19,44 @@
 ```
 /
 ├── main.py                          # Точка входа (запускает orchestrator)
-├── .env                             # Конфигурация (API ключи Bybit)
+├── .env                             # Конфигурация (API ключи Bybit + Telegram)
 ├── arbitrage.db                     # SQLite база данных
 │
 ├── orchestrator.py                  # Главный координатор: сканирование + многопоточный мониторинг
 ├── config.py                        # Все константы и пороговые значения
 │
-├── /database/                       # 🆕 Слой работы с БД
+├── /database/                       # Слой работы с БД
 │   ├── __init__.py
 │   ├── database.py                  # Инициализация БД, SQLAlchemy engine, session
 │   ├── models.py                    # SQLAlchemy модели (Position, ClosedPosition, Blacklist)
 │   └── /repositories/               # Repository Pattern для доступа к данным
 │       ├── __init__.py
+│       ├── base_repository.py       # Базовый класс для всех репозиториев
 │       ├── position_repository.py   # CRUD операции с позициями
 │       ├── history_repository.py    # Работа с историей закрытых позиций
 │       └── blacklist_repository.py  # Работа с blacklist
 │
-├── /migrations/                     # 🆕 Alembic миграции БД
+├── /migrations/                     # Alembic миграции БД
 │   ├── env.py                       # Конфигурация Alembic
 │   ├── script.py.mako               # Шаблон для новых миграций
 │   ├── alembic.ini                  # Настройки Alembic
 │   └── /versions/                   # История миграций
 │       └── xxx_initial_schema.py
 │
-├── /scripts/                        # 🆕 Утилиты и скрипты
+├── /scripts/                        # Утилиты и скрипты
 │   └── migrate_blacklist_to_db.py   # Миграция blacklist.json → БД (одноразовый)
+│
+├── /telegram_bot/                   # 🆕 Telegram бот интеграция
+│   ├── __init__.py
+│   ├── bot.py                       # Главный класс TelegramBot (lifecycle management)
+│   ├── handlers.py                  # Command handlers (/start, /status, /positions, /stats)
+│   ├── formatters.py                # Message formatters (форматирование данных)
+│   ├── notifications.py             # Notification service (отправка уведомлений)
+│   └── config.py                    # Telegram конфигурация (токен, admin chat_ids)
+│
+├── /integration/                    # 🆕 Интеграция внешних сервисов
+│   ├── __init__.py
+│   └── telegram_integration.py      # TelegramIntegration (singleton для доступа к боту)
 │
 ├── /api/
 │   ├── api_client.py                # Базовый клиент Bybit API (GET/POST с retry)
@@ -76,7 +90,7 @@
 
 ### 1. Database Layer (database/)
 
-**Новый слой доступа к данным с использованием Repository Pattern**
+**Слой доступа к данным с использованием Repository Pattern**
 
 #### database.py
 - Создание SQLAlchemy engine и session factory
@@ -136,7 +150,7 @@ class Blacklist(Base):
 - `get_all_history()` - вся история
 - `get_history_by_crypto()` - история по конкретной криптовалюте
 - `get_recent_history()` - последние N закрытых позиций
-- `get_statistics()` - статистика (total PnL, win rate, avg PnL)
+- `get_statistics()` / `calculate_statistics()` - статистика (total PnL, win rate, avg PnL)
 
 **BlacklistRepository** (`blacklist_repository.py`)
 - `add_to_blacklist()` - добавление в blacklist
@@ -146,7 +160,348 @@ class Blacklist(Base):
 - `get_all_details()` - все записи с деталями
 - `bulk_add()` - массовое добавление (для миграции)
 
-### 2. MultiCryptoOrchestrator (orchestrator.py)
+### 2. Telegram Bot Integration (telegram_bot/) 🆕
+
+**Полнофункциональная интеграция с Telegram для уведомлений и управления**
+
+#### Архитектура
+- **bot.py**: Главный класс `TelegramBot` - управление жизненным циклом бота
+- **handlers.py**: Command handlers - обработка пользовательских команд
+- **formatters.py**: Message formatters - форматирование данных для Telegram
+- **notifications.py**: Notification service - отправка уведомлений о событиях
+- **config.py**: Конфигурация (токен бота, admin chat IDs)
+
+#### TelegramBot (bot.py)
+
+**Главный класс для управления Telegram ботом**
+
+```python
+class TelegramBot:
+    def __init__(
+        self,
+        position_repo: Optional[PositionRepository] = None,
+        history_repo: Optional[HistoryRepository] = None,
+        blacklist_repo: Optional[BlacklistRepository] = None
+    ):
+        # Dependency Injection репозиториев
+        self.position_repo = position_repo or PositionRepository()
+        self.history_repo = history_repo or HistoryRepository()
+        self.blacklist_repo = blacklist_repo or BlacklistRepository()
+
+        # Создание handlers с доступом к репозиториям
+        self.handlers = CommandHandlers(...)
+
+        # Создание Application
+        self.application = Application.builder().token(BOT_TOKEN).build()
+
+    def start(self) -> bool:
+        # Запускает бота в отдельном daemon thread
+        # Использует asyncio.new_event_loop() для совместимости с threading
+
+    def stop(self) -> None:
+        # Корректное завершение работы бота
+```
+
+**Особенности реализации**:
+- Запуск в отдельном daemon thread (не блокирует основной процесс)
+- Использование `asyncio.new_event_loop()` для работы в non-main thread
+- Dependency Injection репозиториев для доступа к данным
+- Graceful shutdown с ожиданием завершения потока
+
+#### Command Handlers (handlers.py)
+
+**Обработчики пользовательских команд**
+
+```python
+class CommandHandlers:
+    async def start(update, context):
+        # Приветственное сообщение + список команд
+
+    async def status(update, context):
+        # Статус системы:
+        # - Время работы
+        # - Количество открытых позиций
+        # - Размер blacklist
+        # - Доступные слоты для новых позиций
+
+    async def positions(update, context):
+        # Список открытых позиций:
+        # - Crypto symbol
+        # - Время входа + длительность
+        # - Цены входа (спот/фьючерс)
+        # - Количества
+        # - Спред входа
+
+    async def stats(update, context):
+        # Статистика торговли:
+        # - Общее количество сделок
+        # - Прибыльные/убыточные
+        # - Win rate
+        # - Total PnL
+        # - Average PnL
+        # - Лучшая/худшая сделка
+```
+
+**Пример вывода `/positions`:**
+```
+📍 ОТКРЫТЫЕ ПОЗИЦИИ (1)
+
+1. BOBA
+├─ Вход: 05.01 16:05 (1ч 15мин назад)
+├─ Спот: 0.042540 USDT (qty: 703.9406)
+├─ Фьючерс: 0.042740 USDT (qty: 701.9000)
+└─ Спред: 0.47%
+```
+
+**Пример вывода `/stats`:**
+```
+📊 Статистика торговли
+
+🔢 Сделки: 12
+✅ Прибыльных: 10 (83.3%)
+❌ Убыточных: 2 (16.7%)
+
+💰 Финансы
+• Общая прибыль: +45.80 USDT
+• Средняя прибыль: +3.82 USDT
+• Лучшая сделка: +8.50 USDT
+• Худшая сделка: -2.10 USDT
+```
+
+#### Notification Service (notifications.py)
+
+**Автоматические уведомления о торговых событиях**
+
+```python
+class TelegramNotificationService:
+    def notify_position_opened(self, position_data: Dict):
+        # Уведомление об открытии позиции
+        # - Crypto symbol
+        # - Цены входа (спот/фьючерс)
+        # - Количества
+        # - Спред входа
+        # - Funding rate
+
+    def notify_position_closed(self, position_data: Dict):
+        # Уведомление о закрытии позиции
+        # - Crypto symbol
+        # - Длительность позиции
+        # - Spot PnL
+        # - Futures PnL
+        # - Funding PnL
+        # - Commission
+        # - Net PnL
+
+    def notify_critical_error(self, error_data: Dict):
+        # 🚨 КРИТИЧЕСКОЕ уведомление
+        # Используется когда фьючерс открыт, но спот не открылся
+        # - Тип ошибки
+        # - Crypto symbol
+        # - Qty фьючерса для ручного закрытия
+        # - Текст ошибки
+
+    def notify_blacklist_added(self, crypto: str, reason: str, error_code: int):
+        # Уведомление о добавлении в blacklist
+        # - Crypto symbol
+        # - Причина
+        # - Код ошибки (если есть)
+```
+
+**Пример уведомления об открытии:**
+```
+🟢 Позиция открыта
+
+💼 BOBA
+• Спот: 0.042540 USDT (qty: 703.94)
+• Фьючерс: 0.042740 USDT (qty: 701.90)
+• Спред: 0.47%
+• Funding Rate: 0.11%
+```
+
+**Пример уведомления о закрытии:**
+```
+🔴 Позиция закрыта
+
+💼 BOBA
+⏱ Время: 2ч 15мин
+
+💰 PnL
+• Спот: +1.25 USDT
+• Фьючерс: +0.80 USDT
+• Фандинг: +0.45 USDT
+• Комиссии: -0.62 USDT
+• Чистая прибыль: +1.88 USDT
+```
+
+**Пример критического уведомления:**
+```
+🚨 КРИТИЧЕСКАЯ ОШИБКА
+
+⚠️ Тип: Фьючерс открыт, спот не открылся
+
+💼 BOBA
+• Qty: 701.9000
+• Ошибка: Insufficient balance
+
+🔴 НЕОБХОДИМО ВРУЧНУЮ ЗАКРЫТЬ ФЬЮЧЕРС!
+```
+
+#### TelegramIntegration (integration/telegram_integration.py)
+
+**Singleton для глобального доступа к Telegram боту**
+
+```python
+class TelegramIntegration:
+    _instance = None  # Singleton
+
+    def __init__(self):
+        self.telegram_bot = TelegramBot(
+            position_repo=PositionRepository(),
+            history_repo=HistoryRepository(),
+            blacklist_repo=BlacklistRepository()
+        )
+        self.notification_service = TelegramNotificationService(...)
+
+    def start_bot(self) -> bool:
+        return self.telegram_bot.start()
+
+    def stop_bot(self):
+        self.telegram_bot.stop()
+
+    def notify_position_opened(self, **kwargs):
+        self.notification_service.notify_position_opened(kwargs)
+
+    def notify_position_closed(self, **kwargs):
+        self.notification_service.notify_position_closed(kwargs)
+
+    # ... другие методы уведомлений
+
+# Глобальный доступ
+def get_telegram_integration() -> Optional[TelegramIntegration]:
+    return TelegramIntegration.get_instance()
+```
+
+**Использование в opportunity_monitor.py:**
+```python
+from integration.telegram_integration import get_telegram_integration
+
+# При открытии позиции
+telegram = get_telegram_integration()
+if telegram:
+    telegram.notify_position_opened(
+        crypto=crypto,
+        spot_entry_price=spot_ask,
+        futures_entry_price=futures_bid,
+        spot_qty=purchased_qty,
+        entry_spread_pct=spread_pct,
+        funding_rate=funding_rate
+    )
+
+# При закрытии позиции
+if telegram:
+    telegram.notify_position_closed(
+        crypto=crypto,
+        entry_time=entry_timestamp,
+        close_time=close_timestamp,
+        spot_pnl=pnl_result['spot_pnl'],
+        futures_pnl=pnl_result['futures_pnl'],
+        funding=pnl_result['funding'],
+        commission=pnl_result['commission'],
+        net_pnl=pnl_result['net_pnl']
+    )
+
+# При критической ошибке
+if telegram:
+    telegram.notify_critical_error(
+        error_type='futures_opened_spot_failed',
+        message=f"Спот ошибка: {spot_result['error']}",
+        crypto=crypto,
+        qty=futures_result['qty']
+    )
+```
+
+#### Конфигурация Telegram (telegram_bot/config.py)
+
+```python
+class TelegramConfig:
+    # Токен бота (получить у @BotFather)
+    BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '7534003941:AAEib...')
+
+    # Admin chat IDs (для получения уведомлений)
+    ADMIN_CHAT_IDS = [
+        # 123456789,  # Твой chat_id (получить через /start)
+    ]
+
+    # Настройки
+    MESSAGE_TIMEOUT = 30  # Таймаут отправки сообщений
+    ENABLE_NOTIFICATIONS = True  # Включить уведомления
+    NOTIFICATION_COOLDOWN = 5  # Минимальный интервал между уведомлениями (сек)
+```
+
+**Как получить chat_id:**
+1. Создать бота через @BotFather → получить токен
+2. Запустить бота: `python main.py`
+3. Написать `/start` в Telegram
+4. В логах увидеть: `[TELEGRAM] Пользователь 123456789 (@username) отправил /start`
+5. Добавить `123456789` в `ADMIN_CHAT_IDS`
+6. Перезапустить бота
+
+#### Интеграция с Orchestrator
+
+```python
+# orchestrator.py
+from integration.telegram_integration import TelegramIntegration
+
+class MultiCryptoOrchestrator:
+    def __init__(self):
+        # ... инициализация репозиториев и менеджеров ...
+
+        # Инициализация Telegram интеграции
+        self.telegram = TelegramIntegration(
+            position_repo=self.position_repo,
+            history_repo=self.history_repo,
+            blacklist_repo=self.blacklist_repo
+        )
+        logger.info("✅ Telegram интеграция инициализирована")
+
+    def run(self):
+        try:
+            # Запуск Telegram бота
+            if self.telegram.start_bot():
+                logger.info("✅ Telegram бот запущен")
+            else:
+                logger.warning("⚠️ Telegram бот не запущен")
+
+            # ... основной цикл торговли ...
+
+        finally:
+            # Остановка Telegram бота при завершении
+            self.telegram.stop_bot()
+```
+
+#### Отключение шумных логов
+
+**В utils/logger_config.py:**
+```python
+def setup_logging():
+    # ... основная настройка ...
+
+    # Отключаем шумные HTTP логи от Telegram
+    logging.getLogger('httpx').setLevel(logging.WARNING)
+    logging.getLogger('telegram').setLevel(logging.WARNING)
+    logging.getLogger('telegram.ext').setLevel(logging.WARNING)
+    logging.getLogger('httpcore').setLevel(logging.WARNING)
+
+    return logger
+```
+
+Это предотвращает спам в логах вида:
+```
+INFO - HTTP Request: POST https://api.telegram.org/bot.../sendMessage "HTTP/1.1 200 OK"
+INFO - HTTP Request: POST https://api.telegram.org/bot.../getUpdates "HTTP/1.1 200 OK"
+```
+
+### 3. MultiCryptoOrchestrator (orchestrator.py)
 
 **Главный координатор с Dependency Injection**
 
@@ -171,6 +526,13 @@ def __init__(self):
     self.blacklist_manager = BlacklistManager(
         blacklist_repo=self.blacklist_repo
     )
+
+    # Telegram интеграция
+    self.telegram = TelegramIntegration(
+        position_repo=self.position_repo,
+        history_repo=self.history_repo,
+        blacklist_repo=self.blacklist_repo
+    )
 ```
 
 #### Сканирование рынка (`scan_opportunities`)
@@ -188,7 +550,7 @@ def __init__(self):
   - **Обычный**: FR < -0.001% И спред <= 0.15%
   - **Мягкий**: FR <= 0.005% И спред <= 0.15% (после 15+ раундов с низким FR)
 
-### 3. OpportunityMonitor (opportunity_monitor.py)
+### 4. OpportunityMonitor (opportunity_monitor.py)
 
 **Логика торговли**: открытие и закрытие позиций
 
@@ -202,8 +564,9 @@ def __init__(self):
 1️⃣ Установка плеча (LEVERAGE = 1)
 2️⃣ Открытие ФЬЮЧЕРСА (SHORT)  ← СНАЧАЛА!
 3️⃣ Открытие СПОТА (LONG)
-   ⚠️ Если спот не открылся → КРИТИЧЕСКАЯ СИТУАЦИЯ
+   ⚠️ Если спот не открылся → КРИТИЧЕСКАЯ СИТУАЦИЯ → Telegram уведомление
 4️⃣ Сохранение в БД через position_manager.save_position()
+5️⃣ Telegram уведомление об успешном открытии
 ```
 
 #### Закрытие позиции (`monitor_open_position_single`)
@@ -220,9 +583,10 @@ def __init__(self):
 1️⃣ Продажа СПОТА (по актуальному балансу)
 2️⃣ Покупка ФЬЮЧЕРСА (по сохраненному qty)
 3️⃣ Сохранение в историю через history_repo.save_closed_position()
+4️⃣ Telegram уведомление о закрытии с PnL
 ```
 
-### 4. MultiPositionManager (position_manager.py)
+### 5. MultiPositionManager (position_manager.py)
 
 **Управление множественными позициями через репозитории**
 
@@ -252,11 +616,7 @@ def __init__(
 - Все операции атомарны
 - Безопасная работа из множественных потоков
 
-#### Backward Compatibility
-- Методы возвращают dict (через `model.to_dict()`) для совместимости с существующим кодом
-- Сигнатуры методов не изменились
-
-### 5. BlacklistManager (blacklist_manager.py)
+### 6. BlacklistManager (blacklist_manager.py)
 
 **Singleton-менеджер с кешированием в памяти**
 
@@ -283,18 +643,13 @@ CRITICAL_ERROR_CODES = [
 ```
 
 #### Ключевые методы
-- `add_to_blacklist()` - добавление в БД + обновление кеша
+- `add_to_blacklist()` - добавление в БД + обновление кеша + Telegram уведомление
 - `is_blacklisted()` - быстрая проверка через кеш
 - `remove_from_blacklist()` - удаление из БД + обновление кеша
 - `get_blacklist()` - копия списка
 - `refresh_cache()` - принудительное обновление кеша из БД
 
-#### Performance Optimization
-- Кеширование в памяти для проверок `is_blacklisted()`
-- Автоматическая синхронизация кеша при операциях add/remove
-- Singleton pattern для глобального доступа
-
-### 6. OrderExecutor (order_executor.py)
+### 7. OrderExecutor (order_executor.py)
 
 **Исполнение ордеров с точностью инструмента**
 
@@ -306,18 +661,7 @@ CRITICAL_ERROR_CODES = [
 - `close_spot_position_qty()` - закрытие спота (по актуальному балансу)
 - `close_futures_position()` - закрытие фьючерса (reduceOnly=True)
 
-#### Формат ответа
-```python
-{
-    "success": bool,
-    "order_id": str,
-    "qty": float,
-    "price": float,
-    "error": str | None
-}
-```
-
-### 7. PnLCalculator (pnl_calculator.py)
+### 8. PnLCalculator (pnl_calculator.py)
 
 **Расчет прибыли/убытка при закрытии позиции**
 
@@ -330,21 +674,7 @@ Commission = (entry_value + exit_value) * commission_rate
 Net PnL = Price PnL + Funding - Commission
 ```
 
-#### Вызов
-```python
-pnl_result = PnLCalculator.calculate_pnl(
-    spot_entry_price=50000.0,
-    spot_exit_price=50100.0,
-    futures_entry_price=50050.0,
-    futures_exit_price=50150.0,
-    spot_qty=0.0006,
-    futures_qty=0.0006,
-    commission_rate=0.002,  # 0.2%
-    total_funding_received=1.5  # USDT
-)
-```
-
-### 8. RealizedFundingCalculator (funding_calculator.py)
+### 9. RealizedFundingCalculator (funding_calculator.py)
 
 **Расчет РЕАЛЬНОГО полученного фандинга через Bybit API**
 
@@ -354,13 +684,7 @@ pnl_result = PnLCalculator.calculate_pnl(
 - Суммирует все `execFee` (с инвертированием знака)
 - Положительное число = прибыль от фандинга
 
-#### Формула
-```
-funding_pnl = -execFee
-total_funding = sum(funding_pnl for all executions)
-```
-
-### 9. Rate Limiter (rate_limiter.py)
+### 10. Rate Limiter (rate_limiter.py)
 
 **Token Bucket алгоритм для защиты от rate limit**
 
@@ -369,67 +693,6 @@ total_funding = sum(funding_pnl for all executions)
 MAX_REQUESTS_PER_SECOND = 50  # (Bybit: 120)
 MAX_WEIGHT_PER_SECOND = 300   # (Bybit: 600)
 ```
-
-#### Веса эндпоинтов
-```python
-ENDPOINT_WEIGHTS = {
-    "/market/tickers": 10,
-    "/market/orderbook": 5,
-    "/order/create": 5,
-    "/execution/list": 10,
-    # ...default: 1
-}
-```
-
-#### Использование
-```python
-rate_limiter.wait_if_needed(endpoint)  # Блокирует поток если превышен лимит
-```
-
-## Миграция данных
-
-### Alembic - управление схемой БД
-
-#### Инициализация (уже выполнено)
-```bash
-alembic init migrations
-```
-
-#### Создание миграции
-```bash
-alembic revision --autogenerate -m "initial_schema"
-```
-
-#### Применение миграций
-```bash
-# Применить все миграции
-alembic upgrade head
-
-# Откатить последнюю миграцию
-alembic downgrade -1
-
-# История миграций
-alembic history
-```
-
-### Миграция blacklist.json → БД
-
-**Скрипт**: `scripts/migrate_blacklist_to_db.py`
-
-```bash
-python scripts/migrate_blacklist_to_db.py
-```
-
-**Функции скрипта**:
-1. Проверяет подключение к БД
-2. Загружает `blacklist.json`
-3. Создает бэкап файла (`blacklist.json.backup`)
-4. Показывает что будет мигрировано
-5. Запрашивает подтверждение
-6. Выполняет миграцию через `BlacklistRepository.bulk_add()`
-7. Проверяет успешность миграции
-
-**После миграции**: можно удалить `blacklist.json` (бэкап сохранен)
 
 ## Конфигурация (config.py)
 
@@ -468,237 +731,12 @@ MONITOR_INTERVAL_SEC = 300    # Интервал проверки позиций
 DATABASE_URL = "sqlite:///./arbitrage.db"  # SQLite файл
 ```
 
-## Стандарты кодирования
-
-### Основные принципы
-- **SOLID**: Четкое разделение ответственности + Dependency Inversion
-- **Repository Pattern**: Слой доступа к данным изолирован от бизнес-логики
-- **Dependency Injection**: Репозитории передаются через конструкторы
-- **Thread Safety**: Все shared state защищен locks (RLock)
-- **Async Pattern**: Threading для параллельного мониторинга (daemon threads)
-- **Type Hints**: Обязательная типизация аргументов и возвратов
-- **Error Handling**: Graceful degradation с retry логикой
-
-### Конвенции именования
-- **Классы**: `PascalCase` (MultiCryptoOrchestrator, PnLCalculator, PositionRepository)
-- **Функции**: `snake_case` (monitor_position, calculate_pnl, save_closed_position)
-- **Константы**: `UPPER_SNAKE_CASE` (MIN_SPREAD_PCT, TRADE_AMOUNT_USD, DATABASE_URL)
-- **Private методы**: `_leading_underscore` (_load_blacklist, _get_signed)
-
-### Обработка ошибок
+### Telegram Bot (telegram_bot/config.py)
 ```python
-try:
-    # Критическая операция (API вызов, БД I/O)
-except SpecificException as e:
-    logger.error(f"[{crypto}] Описание: {e}", exc_info=True)
-    # Retry или return fallback значение
-```
-
-## Логирование
-
-### Структура логов
-```
-[2026-01-03 14:30:00] [orchestrator] [INFO] 🔧 Инициализация оркестратора...
-[2026-01-03 14:30:00] [orchestrator] [INFO] ✅ Подключение к БД успешно
-[2026-01-03 14:30:00] [orchestrator] [INFO] ✅ Найдено открытых позиций: 1
-[2026-01-03 14:30:00] [orchestrator] [INFO] 📋 Список: BTC
-[2026-01-03 14:30:05] [BTC] [INFO] 🔍 Мониторинг закрытия...
-[2026-01-03 14:30:05] [BTC] [INFO] └─ FR 0.0150% >= -0.001%, ждем снижения FR
-[2026-01-03 14:35:00] [BTC] [INFO] 🔥 Условия закрытия выполнены
-[2026-01-03 14:35:01] [BTC] [INFO] ✅ Позиция успешно закрыта
-[2026-01-03 14:35:02] [orchestrator] [INFO] 💰 NET PnL: +0.45 USDT ✅
-```
-
-### Уровни
-- `DEBUG`: Детальная информация (API запросы, SQL queries, проверки условий)
-- `INFO`: Основные события (открытие/закрытие позиций, сканирование, БД операции)
-- `WARNING`: Предупреждения (timeout, blacklist добавление)
-- `ERROR`: Ошибки (API failures, БД I/O проблемы)
-- `CRITICAL`: Критические ситуации (фьючерс открыт, спот не открыт, БД недоступна)
-
-## Сценарии работы
-
-### 1. Нормальный цикл торговли
-
-```
-1. Orchestrator.__init__()
-   ├─ check_db_connection() - проверка подключения к БД
-   ├─ Создание репозиториев (position_repo, history_repo, blacklist_repo)
-   └─ Создание менеджеров с DI
-       ↓
-2. Orchestrator.run()
-   ├─ restore_monitoring() - восстановление мониторинга из БД
-   └─ scan_opportunities() - каждые 180 секунд
-       ↓
-3. scan_opportunities()
-   ├─ Получить символы (PriceFetcher.get_all_symbols)
-   ├─ Фильтр blacklist (через blacklist_manager → кеш → БД)
-   ├─ Получить orderbooks (batch)
-   ├─ Фильтр по спреду (SpreadAnalyzer)
-   ├─ Получить funding rates (batch)
-   ├─ Найти топ возможности (ArbitrageCalculator)
-   └─ Запустить потоки открытия
-       ↓
-4. try_open_position(crypto) - в отдельном потоке
-   ├─ OpportunityMonitor.monitor_and_execute()
-   ├─ Ожидание условий входа
-   ├─ Установка плеча
-   ├─ Открытие ФЬЮЧЕРСА
-   ├─ Открытие СПОТА
-   └─ position_manager.save_position() → position_repo.create_position() → БД
-       ↓
-5. monitor_position(crypto) - daemon thread
-   ├─ Цикл каждые 300 секунд
-   ├─ Получение funding rate
-   ├─ Получение orderbook
-   ├─ Проверка условий закрытия
-   └─ При выполнении:
-       ├─ PositionCloser.close_position()
-       └─ position_manager.close_position_with_pnl()
-           ├─ RealizedFundingCalculator.get_accumulated_funding()
-           ├─ PnLCalculator.calculate_pnl()
-           ├─ history_repo.save_closed_position() → БД
-           └─ position_repo.delete_by_crypto() → БД
-```
-
-### 2. Обработка ошибок при открытии
-
-```
-Сценарий 1: Фьючерс не открылся
-├─ Логирование ошибки
-├─ Проверка error_code
-└─ Если критический → blacklist_manager.add_to_blacklist() → БД
-
-Сценарий 2: Фьючерс открыт, спот НЕ открыт (КРИТИЧНО!)
-├─ logger.critical("НЕОБХОДИМО ВРУЧНУЮ ЗАКРЫТЬ ФЬЮЧЕРС")
-├─ Логирование qty для ручного закрытия
-└─ Добавление в blacklist (если критический код) → БД
-```
-
-### 3. Восстановление после перезапуска
-
-```
-1. Orchestrator.__init__()
-   ├─ check_db_connection()
-   ├─ Создание репозиториев
-   └─ MultiPositionManager.__init__()
-       ├─ position_repo.get_positions_count() → БД
-       └─ Логирование количества позиций
-           ↓
-2. Orchestrator.restore_monitoring()
-   ├─ position_manager.get_open_cryptos() → position_repo.get_open_cryptos() → БД
-   └─ Для каждой позиции:
-       ├─ Получение данных из БД
-       ├─ Логирование данных входа
-       ├─ Добавление в active_threads
-       └─ Запуск monitor_position() в daemon thread
-```
-
-## Rate Limiting стратегия
-
-### Batch запросы
-```python
-# Вместо N последовательных запросов:
-for symbol in symbols:
-    get_orderbook(symbol)  # BAD: N requests
-
-# Используем batch:
-get_orderbook_batch(symbols)  # GOOD: 1 request через tickers
-```
-
-### Приоритеты запросов
-1. **Критические** (открытие/закрытие позиций): не ждут
-2. **Мониторинг** (проверка условий): могут ждать до 5 секунд
-3. **Сканирование** (поиск возможностей): ждут по необходимости
-
-### Retry логика в BybitAPIClient
-```
-Попытка 1: немедленно
-Попытка 2: +1 секунда
-Попытка 3: +2 секунды
-
-HTTP 429 → ждем Retry-After header
-retCode 10006 → ждем 1 секунду
-Timeout → экспоненциальный backoff
-```
-
-## Безопасность и надежность
-
-### Thread Safety гарантии
-- `MultiPositionManager`: RLock на все операции
-- `BlacklistManager`: RLock + Singleton pattern + кеш
-- `Orchestrator.active_threads`: threading.Lock для добавления/удаления
-- **SQLAlchemy sessions**: scoped_session для thread-safety
-
-### Критические проверки
-1. **Перед открытием позиции**:
-   - Проверка blacklist (кеш + БД)
-   - Проверка уже открытой позиции (БД)
-   - Проверка активных потоков открытия
-   - Проверка лимита позиций (БД)
-
-2. **Перед закрытием позиции**:
-   - Проверка существования позиции (БД)
-   - Проверка актуального баланса (спот)
-   - Проверка сохраненного qty (фьючерс)
-
-### База данных
-- **SQLite WAL mode**: параллельное чтение + один писатель
-- **Индексы**: на часто используемые поля (crypto, timestamps)
-- **Foreign Keys**: включены для целостности данных
-- **Транзакции**: автоматический commit/rollback
-- **Connection pool**: через scoped_session
-
-## Мониторинг и отладка
-
-### Ключевые метрики
-```python
-# В логах:
-- Количество открытых позиций / MAX_CONCURRENT_POSITIONS
-- Blacklist размер и содержимое (из БД)
-- Время выполнения операций (сканирование, открытие, закрытие, БД queries)
-- Rate limit статистика (requests/sec, weight/sec)
-```
-
-### Debug режим
-```python
-# В logger_config.py:
-logging.basicConfig(level=logging.DEBUG)  # Подробные логи + SQL queries
-
-# В main.py:
-if __name__ == "__main__":
-    orchestrator = MultiCryptoOrchestrator()
-    orchestrator.run()
-```
-
-### Анализ истории
-```python
-# Через repository:
-from database.repositories.history_repository import HistoryRepository
-
-repo = HistoryRepository()
-
-# Последние 10 закрытых позиций
-recent = repo.get_recent_history(limit=10)
-for pos in recent:
-    print(f"{pos.crypto}: {pos.net_pnl:+.4f} USDT")
-
-# Статистика
-stats = repo.get_statistics()
-print(f"Total PnL: {stats['total_pnl']:.2f} USDT")
-print(f"Win Rate: {stats['win_rate']:.1%}")
-print(f"Avg PnL: {stats['avg_pnl']:.2f} USDT")
-```
-
-### Просмотр БД
-```bash
-# SQLite CLI
-sqlite3 arbitrage.db
-sqlite> .tables
-sqlite> SELECT * FROM positions;
-sqlite> SELECT crypto, net_pnl FROM closed_positions ORDER BY close_timestamp DESC LIMIT 10;
-
-# Или DB Browser for SQLite (GUI)
+BOT_TOKEN = "7534003941:AAEib2A0V-aY1ohtj7yam5Wm6_7U1hU5HAA"
+ADMIN_CHAT_IDS = []  # Добавить свой chat_id после /start
+ENABLE_NOTIFICATIONS = True
+MESSAGE_TIMEOUT = 30
 ```
 
 ## Deployment
@@ -709,11 +747,12 @@ Python 3.9+
 sqlalchemy>=2.0.0
 alembic>=1.13.0
 requests
+python-telegram-bot==20.7
 ```
 
 ### Установка
 ```bash
-pip install sqlalchemy alembic requests
+pip install sqlalchemy alembic requests python-telegram-bot==20.7
 ```
 
 ### Переменные окружения (.env)
@@ -721,6 +760,9 @@ pip install sqlalchemy alembic requests
 # Bybit API
 BYBIT_API_KEY=your_api_key
 BYBIT_API_SECRET=your_api_secret
+
+# Telegram Bot
+TELEGRAM_BOT_TOKEN=7534003941:AAEib2A0V-aY1ohtj7yam5Wm6_7U1hU5HAA
 
 # База данных (опционально)
 DATABASE_URL=sqlite:///./arbitrage.db
@@ -738,9 +780,49 @@ alembic upgrade head
 python scripts/migrate_blacklist_to_db.py
 ```
 
+### Настройка Telegram бота
+
+#### 1. Создание бота
+1. Написать @BotFather в Telegram
+2. Отправить `/newbot`
+3. Указать имя бота
+4. Скопировать токен
+
+#### 2. Получение chat_id
+1. Запустить бота: `python main.py`
+2. Написать `/start` своему боту в Telegram
+3. В логах увидеть:
+   ```
+   [TELEGRAM] Пользователь 123456789 (@username) отправил /start
+   ```
+4. Открыть `telegram_bot/config.py`
+5. Добавить свой chat_id:
+   ```python
+   ADMIN_CHAT_IDS = [123456789]
+   ```
+6. Перезапустить бота
+
+#### 3. Проверка работы
+```
+/start    - Приветствие + список команд
+/status   - Статус системы
+/positions - Открытые позиции
+/stats    - Статистика торговли
+```
+
 ### Запуск
 ```bash
 python main.py
+```
+
+**Ожидаемые логи:**
+```
+2026-01-05 17:00:00 - INFO - 🔧 Инициализация оркестратора...
+2026-01-05 17:00:00 - INFO - ✅ Подключение к БД успешно
+2026-01-05 17:00:00 - INFO - ✅ Telegram интеграция инициализирована
+2026-01-05 17:00:00 - INFO - ✅ Telegram бот запущен
+2026-01-05 17:00:00 - INFO - 🚀 Запуск Telegram Bot polling...
+2026-01-05 17:00:01 - INFO - ✅ Telegram Bot polling запущен
 ```
 
 ### Мониторинг (tmux)
@@ -755,6 +837,33 @@ python main.py
 # Присоединиться обратно: tmux attach -t arbitrage
 ```
 
+## Логирование
+
+### Структура логов
+```
+[2026-01-05 17:00:00] [INFO] 🔧 Инициализация оркестратора...
+[2026-01-05 17:00:00] [INFO] ✅ Telegram интеграция активна
+[2026-01-05 17:00:01] [INFO] [BTC] 🔍 Мониторинг закрытия...
+[2026-01-05 17:00:01] [INFO] [BTC] └─ FR 0.0150% >= -0.001%, ждем снижения FR
+[2026-01-05 17:05:00] [INFO] [BTC] 🔥 Условия закрытия выполнены
+[2026-01-05 17:05:01] [INFO] [BTC] ✅ Позиция успешно закрыта
+[2026-01-05 17:05:02] [INFO] 💰 NET PnL: +0.45 USDT ✅
+```
+
+### Уровни
+- `DEBUG`: Детальная информация (API запросы, SQL queries)
+- `INFO`: Основные события (открытие/закрытие, Telegram уведомления)
+- `WARNING`: Предупреждения (timeout, blacklist)
+- `ERROR`: Ошибки (API failures, БД проблемы)
+- `CRITICAL`: Критические ситуации (фьючерс открыт, спот не открыт)
+
+### Отключение шумных логов
+В `utils/logger_config.py`:
+```python
+logging.getLogger('httpx').setLevel(logging.WARNING)
+logging.getLogger('telegram').setLevel(logging.WARNING)
+```
+
 ## Roadmap & Known Issues
 
 ### Completed ✅
@@ -763,94 +872,26 @@ python main.py
 - [x] Alembic для управления миграциями
 - [x] Dependency Injection в менеджеры
 - [x] Скрипт миграции blacklist.json → БД
+- [x] Telegram бот для уведомлений и управления
+- [x] Real-time notifications о торговых событиях
+- [x] Command handlers (/start, /status, /positions, /stats)
+- [x] Критические уведомления (фьючерс открыт, спот не открылся)
 
 ### TODO
-- [ ] Telegram бот для уведомлений и управления
 - [ ] Web dashboard для мониторинга (FastAPI + React)
 - [ ] Unit-тесты (pytest) с mock репозиториями
 - [ ] Backtesting на исторических данных
 - [ ] Поддержка других бирж (Binance, OKX)
 - [ ] PostgreSQL support для production
+- [ ] Telegram команды для управления (/close, /blacklist add/remove)
+- [ ] Графики PnL в Telegram
 
 ### Известные ограничения
 - Максимум 1 одновременная позиция (можно увеличить в config)
 - Bybit rate limits: 120 req/sec, 600 weight/sec (используем 50 и 300)
 - Funding rate обновляется каждые 8 часов (00:00, 08:00, 16:00 UTC)
 - SQLite не подходит для очень высокой нагрузки (миграция на PostgreSQL)
-
-### Критические зависимости
-- **НЕ изменять** порядок открытия (сначала фьючерс, потом спот)
-- **НЕ изменять** логику RLock в MultiPositionManager (deadlock риск)
-- **ОБЯЗАТЕЛЬНО** сохранять логику закрытия позиций с PnL
-- Проверки blacklist **ОБЯЗАТЕЛЬНЫ** перед каждым открытием
-- **SQLAlchemy sessions** должны быть в контексте `with` для автоматического cleanup
-
-## Примеры использования
-
-### Добавление криптовалюты в blacklist вручную
-```python
-from managers.blacklist_manager import blacklist_manager
-
-blacklist_manager.add_to_blacklist(
-    crypto="LUNA",
-    reason="Manual blacklist: delisting announcement",
-    error_code=None
-)
-# Автоматически сохранится в БД и обновит кеш
-```
-
-### Удаление из blacklist
-```python
-blacklist_manager.remove_from_blacklist("LUNA")
-```
-
-### Просмотр истории PnL через репозиторий
-```python
-from database.repositories.history_repository import HistoryRepository
-
-repo = HistoryRepository()
-
-# Последние 10 позиций
-recent = repo.get_recent_history(limit=10)
-for pos in recent:
-    print(f"{pos.crypto}: {pos.net_pnl:+.4f} USDT (закрыто {pos.close_timestamp})")
-
-# Статистика
-stats = repo.get_statistics()
-print(f"\nСтатистика:")
-print(f"  Всего сделок: {stats['total_trades']}")
-print(f"  Прибыльных: {stats['winning_trades']}")
-print(f"  Win Rate: {stats['win_rate']:.1%}")
-print(f"  Общий PnL: {stats['total_pnl']:+.2f} USDT")
-print(f"  Средний PnL: {stats['avg_pnl']:+.2f} USDT")
-```
-
-### Получение позиции через менеджер
-```python
-from managers.position_manager import MultiPositionManager
-
-manager = MultiPositionManager()
-
-# Проверка наличия позиции
-if manager.has_position("BTC"):
-    pos = manager.get_position("BTC")
-    print(f"BTC позиция:")
-    print(f"  Вход: спот={pos['spot_entry_price']}, фьюч={pos['futures_entry_price']}")
-    print(f"  Qty: {pos['spot_qty']}")
-    print(f"  Спред: {pos['entry_spread_pct']:.2f}%")
-```
-
-### Создание новой миграции
-```bash
-# После изменения моделей в models.py
-alembic revision --autogenerate -m "add_new_field"
-
-# Применить миграцию
-alembic upgrade head
-
-# Откатить
-alembic downgrade -1
-```
+- Telegram бот работает в daemon thread (завершается при остановке основного процесса)
 
 ## FAQ
 
@@ -859,6 +900,7 @@ alembic downgrade -1
 Фьючерс критичнее для арбитража:
 - Если спот не купится, можно закрыть фьючерс без убытка
 - Если фьючерс не откроется после покупки спота, будем держать спот с риском движения цены
+- При ошибке спота после открытия фьючерса → критическое Telegram уведомление
 
 ### Как изменить размер позиции?
 
@@ -881,7 +923,40 @@ MAX_CONCURRENT_POSITIONS = 3  # Было 1
 1. Перезапустить бота: `python main.py`
 2. Он автоматически восстановит мониторинг открытых позиций из БД
 3. Проверить логи на ошибки
-4. Проверить состояние БД: `sqlite3 arbitrage.db` → `SELECT * FROM positions;`
+4. Проверить Telegram - придет уведомление о восстановлении
+
+### Почему не приходят Telegram уведомления?
+
+1. Проверить что бот запущен (логи: "✅ Telegram Bot polling запущен")
+2. Проверить что добавлен chat_id в `ADMIN_CHAT_IDS`:
+   - Написать `/start` боту
+   - В логах найти свой chat_id
+   - Добавить в `telegram_bot/config.py`
+   - Перезапустить бота
+3. Проверить что `ENABLE_NOTIFICATIONS = True` в config
+4. Проверить что токен бота правильный в `.env`
+
+### Как отключить Telegram уведомления?
+
+```python
+# telegram_bot/config.py
+ENABLE_NOTIFICATIONS = False
+```
+
+Команды бота (/start, /status, /positions, /stats) продолжат работать.
+
+### Как добавить нескольких администраторов?
+
+```python
+# telegram_bot/config.py
+ADMIN_CHAT_IDS = [
+    123456789,   # Админ 1
+    987654321,   # Админ 2
+    555777999,   # Админ 3
+]
+```
+
+Все указанные пользователи будут получать уведомления.
 
 ### Как перенести данные на другой сервер?
 
@@ -889,39 +964,20 @@ MAX_CONCURRENT_POSITIONS = 3  # Было 1
 # Скопировать файлы:
 scp arbitrage.db user@server:/path/to/project/
 scp -r migrations/ user@server:/path/to/project/
+scp .env user@server:/path/to/project/
 
 # На новом сервере:
-alembic upgrade head  # Проверка миграций
-python main.py        # Запуск
+pip install -r requirements.txt
+alembic upgrade head
+python main.py
 ```
-
-### Как перейти с SQLite на PostgreSQL?
-
-1. Установить PostgreSQL и `psycopg2`:
-   ```bash
-   pip install psycopg2-binary
-   ```
-
-2. Изменить `config.py`:
-   ```python
-   DATABASE_URL = "postgresql://user:password@localhost:5432/arbitrage_db"
-   ```
-
-3. Обновить `alembic.ini`:
-   ```ini
-   sqlalchemy.url = postgresql://user:password@localhost:5432/arbitrage_db
-   ```
-
-4. Применить миграции:
-   ```bash
-   alembic upgrade head
-   ```
 
 ---
 
-**Версия документации**: 4.0 (Database Edition)  
+**Версия документации**: 5.0 (Telegram Edition)  
 **Дата обновления**: Январь 2026  
 **Автор проекта**: Александр  
 **Exchange**: Bybit  
 **Strategy**: Spot-Futures Arbitrage (Cash & Carry)  
-**Storage**: SQLite (SQLAlchemy ORM) + Alembic Migrations
+**Storage**: SQLite (SQLAlchemy ORM) + Alembic Migrations  
+**Notifications**: Telegram Bot (python-telegram-bot v20+)
