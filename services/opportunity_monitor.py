@@ -109,8 +109,26 @@ class OpportunityMonitor:
             # Мы продаем спот (bid) и покупаем фьюч (ask) для закрытия
             current_close_spread = (fut_ask - spot_bid) / spot_bid * 100
 
+            # 🆕 Рассчитываем спред для ДОКУПКИ (открытия)
+            spot_ask = spot_ob.get('ask')
+            futures_bid = fut_ob.get('bid')
+
+            if spot_ask and futures_bid:
+                # Спред для докупки: (futures_bid - spot_ask) / spot_ask
+                current_addition_spread = (futures_bid - spot_ask) / spot_ask * 100
+                
+                # Получаем целевой спред для следующей докупки
+                from config import ADDITION_SPREAD_INCREMENT
+                last_entry_spread = current_position.get('last_entry_spread_pct', 
+                                                        current_position.get('entry_spread_pct', 0))
+                target_addition_spread = last_entry_spread + ADDITION_SPREAD_INCREMENT
+                
+                addition_spread_info = f", Спред докупки: текущий {current_addition_spread:.4f}% / нужно {target_addition_spread:.4f}%"
+            else:
+                addition_spread_info = ""
+
             logger.info(f"[{crypto}] [{attempts}/{max_attempts}] FR: {funding_rate:.4f}%, "
-                        f"Спред закрытия: {current_close_spread:.4f}%")
+                        f"Спред закрытия: {current_close_spread:.4f}%{addition_spread_info}")
 
             # Проверяем мягкий режим
             soft_mode_active = current_position.get('consecutive_low_fr', False)
@@ -289,10 +307,14 @@ class OpportunityMonitor:
             # Рассчитываем целевой спред для следующей докупки
             target_spread = last_entry_spread + ADDITION_SPREAD_INCREMENT
             
-            logger.debug(
-                f"[{crypto}] [Попытка {attempts}] Вход #{total_entries}: "
-                f"Текущий спред {current_spread:.4f}%, "
-                f"Целевой {target_spread:.4f}% (+{ADDITION_SPREAD_INCREMENT:.2f}%)"
+            # 🆕 Получаем FR для логирования
+            funding_rate = FundingRateFetcher.get_single_funding_rate(crypto)
+            fr_str = f"{funding_rate:.4f}%" if funding_rate is not None else "N/A"
+
+            logger.info(
+                f"[{crypto}] [{attempts}/{max_monitoring_attempts}] "
+                f"FR: {fr_str}, "
+                f"Спред докупки: текущий {current_spread:.4f}% / нужно {target_spread:.4f}%"
             )
             
             # Проверяем условие докупки

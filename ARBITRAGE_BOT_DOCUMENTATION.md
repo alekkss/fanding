@@ -2,10 +2,12 @@
 
 Автоматический арбитражный бот для криптовалютной биржи Bybit. Система торгует арбитражем между спот и фьючерсными рынками, зарабатывая на положительном funding rate и спредах цен. Поддерживает множественные одновременные позиции с автоматическим мониторингом и закрытием по достижению целевых условий.
 
+**🆕 НОВАЯ ФУНКЦИЯ**: Система докупок позиций при росте спреда для максимизации прибыли.
+
 ## Архитектура
 
 - **Exchange**: Bybit API v5
-- **Strategy**: Spot-Futures Arbitrage (Cash & Carry)
+- **Strategy**: Spot-Futures Arbitrage (Cash & Carry) + Pyramiding
 - **Concurrency**: Threading + ThreadPoolExecutor
 - **Rate Limiting**: Token Bucket Algorithm
 - **Storage**: SQLite база данных (SQLAlchemy ORM)
@@ -13,6 +15,166 @@
 - **Design Pattern**: Repository Pattern + Dependency Injection
 - **Notifications**: Telegram Bot (python-telegram-bot v20+)
 - **Logging**: Структурированное логирование с уровнями
+
+## 🆕 Система докупок позиций (Position Pyramiding)
+
+### Концепция
+
+**Пирамидинг** - стратегия увеличения размера позиции по мере роста спреда. Когда спред увеличивается на +0.15% от последнего входа, бот автоматически докупает такой же объем, усредняя цену входа.
+
+### Преимущества
+
+- **Максимизация прибыли**: Больше объем при расширении спреда = больше прибыли при схлопывании
+- **Усреднение цены**: Weighted average entry price для точного расчета PnL
+- **Контролируемый риск**: Максимум 3 докупки + cooldown между входами
+- **Автоматизация**: Параллельный мониторинг в отдельном потоке
+
+### Логика работы
+
+```
+Вход 1 (начальный): Спред 0.45%
+  ↓ Спред вырос до 0.60% (+0.15%)
+Докупка 1: Усредненная цена, total_entries = 2
+  ↓ Спред вырос до 0.75% (+0.15%)
+Докупка 2: Усредненная цена, total_entries = 3
+  ↓ Спред вырос до 0.90% (+0.15%)
+Докупка 3: Усредненная цена, total_entries = 4 (лимит достигнут)
+```
+
+### Условия докупки
+
+1. **Рост спреда**: Текущий спред >= последний спред + 0.15%
+2. **Cooldown**: Прошло минимум 5 минут (300 сек) с последней докупки
+3. **Лимит входов**: Максимум 3 докупки (итого 4 входа на позицию)
+4. **Позиция открыта**: Мониторинг работает пока позиция не закрыта
+
+### Усреднение цен (Weighted Average)
+
+```python
+# Формула усреднения
+new_avg_price = (old_avg_price * old_qty + new_price * new_qty) / (old_qty + new_qty)
+
+# Пример
+Вход 1: Цена 100 USDT, qty 10 → avg = 100
+Докупка 1: Цена 102 USDT, qty 10 → avg = (100*10 + 102*10) / 20 = 101
+Докупка 2: Цена 104 USDT, qty 10 → avg = (101*20 + 104*10) / 30 = 102
+```
+
+### Архитектура системы докупок
+
+```
+OpportunityMonitor.monitor_open_position_single()
+    ↓ Запускает параллельный поток
+    ↓
+OpportunityMonitor.monitor_additional_buys()  (daemon thread)
+    ↓ Каждые 5 минут проверяет условия
+    ↓
+    ├─ Проверка: позиция существует?
+    ├─ Проверка: не достигнут лимит докупок?
+    ├─ Проверка: cooldown истек?
+    ├─ Проверка: спред вырос на +0.15%?
+    ↓
+    ├─ ШАГ 1: Открытие фьючерса (SHORT)
+    ├─ ШАГ 2: Открытие спота (LONG)
+    ↓
+PositionManager.add_to_position()
+    ↓ Усреднение цен weighted average
+    ↓ Обновление qty (суммирование)
+    ↓ Обновление метаданных (total_entries, last_addition_timestamp)
+    ↓
+PositionRepository.update_position()
+    ↓ Сохранение в БД
+```
+
+### Новые поля в Position Model
+
+```python
+class Position(Base):
+    # ... существующие поля ...
+
+    # 🆕 Поля для системы докупок
+    total_entries = Column(Integer, default=1)  # Количество входов (1 = начальный, 2+ = с докупками)
+    average_spot_entry_price = Column(Float, nullable=True)  # Усредненная цена спота
+    average_futures_entry_price = Column(Float, nullable=True)  # Усредненная цена фьючерса
+    last_addition_timestamp = Column(DateTime, nullable=True)  # Время последней докупки (для cooldown)
+    last_entry_spread_pct = Column(Float, nullable=True)  # Спред последнего входа (для расчета +0.15%)
+```
+
+### Новые методы в PositionManager
+
+#### `add_to_position()`
+
+```python
+def add_to_position(
+    self,
+    crypto: str,
+    new_spot_price: float,
+    new_futures_price: float,
+    new_spot_qty: float,
+    new_futures_qty: float,
+    new_spread_pct: float
+) -> bool:
+    """
+    Докупка к существующей позиции с усреднением цен.
+
+    Args:
+        crypto: Символ криптовалюты
+        new_spot_price: Цена нового спот входа
+        new_futures_price: Цена нового фьючерс входа
+        new_spot_qty: Докупленное qty спота
+        new_futures_qty: Докупленное qty фьючерса
+        new_spread_pct: Спред при докупке
+
+    Returns:
+        bool: True если успешно обновлено
+
+    Действия:
+        1. Получает текущую позицию из репозитория
+        2. Рассчитывает усредненные цены (weighted average)
+        3. Суммирует количества
+        4. Обновляет метаданные докупок
+        5. Сохраняет в БД через репозиторий
+    """
+```
+
+**Формула weighted average:**
+```python
+new_avg_spot = (old_avg * old_qty + new_price * new_qty) / (old_qty + new_qty)
+new_avg_futures = (old_avg * old_qty + new_price * new_qty) / (old_qty + new_qty)
+```
+
+### Отображение в Telegram
+
+#### Команда `/positions`
+
+```
+📍 ОТКРЫТЫЕ ПОЗИЦИИ (1)
+
+1. BTC
+├─ Вход: 07.01 16:05 (2ч 15мин назад)
+├─ 🔢 Входов: 3
+├─ 📊 Усредненные цены:
+│   ├─ Спот: 45150.234567 USDT
+│   └─ Фьюч: 45350.123456 USDT
+├─ Спот qty: 0.066
+├─ Фьючерс qty: 0.065
+└─ Спред: 0.75%
+```
+
+#### Команда `/history`
+
+```
+📜 ИСТОРИЯ ЗАКРЫТЫХ ПОЗИЦИЙ
+
+1. BTC
+✅ Прибыль: +2.45 USDT
+📊 Входов: 3
+├─ Вход: 07.01 16:05
+├─ Закрытие: 07.01 19:20
+├─ Длительность: 3ч 15мин
+├─ Спред входа: 0.75%
+└─ PnL: Spot +1.20 | Fut +0.80 | FR +0.65 | Comm -0.20
+```
 
 ## Структура проекта
 
@@ -28,7 +190,7 @@
 ├── /database/                       # Слой работы с БД
 │   ├── __init__.py
 │   ├── database.py                  # Инициализация БД, SQLAlchemy engine, session
-│   ├── models.py                    # SQLAlchemy модели (Position, ClosedPosition, Blacklist)
+│   ├── models.py                    # 🆕 SQLAlchemy модели (с полями докупок)
 │   └── /repositories/               # Repository Pattern для доступа к данным
 │       ├── __init__.py
 │       ├── base_repository.py       # Базовый класс для всех репозиториев
@@ -46,15 +208,15 @@
 ├── /scripts/                        # Утилиты и скрипты
 │   └── migrate_blacklist_to_db.py   # Миграция blacklist.json → БД (одноразовый)
 │
-├── /telegram_bot/                   # 🆕 Telegram бот интеграция
+├── /telegram_bot/                   # Telegram бот интеграция
 │   ├── __init__.py
 │   ├── bot.py                       # Главный класс TelegramBot (lifecycle management)
-│   ├── handlers.py                  # Command handlers (/start, /status, /positions, /stats)
-│   ├── formatters.py                # Message formatters (форматирование данных)
+│   ├── handlers.py                  # 🆕 Command handlers (с поддержкой докупок)
+│   ├── formatters.py                # 🆕 Message formatters (отображение докупок)
 │   ├── notifications.py             # Notification service (отправка уведомлений)
 │   └── config.py                    # Telegram конфигурация (токен, admin chat_ids)
 │
-├── /integration/                    # 🆕 Интеграция внешних сервисов
+├── /integration/                    # Интеграция внешних сервисов
 │   ├── __init__.py
 │   └── telegram_integration.py      # TelegramIntegration (singleton для доступа к боту)
 │
@@ -68,11 +230,11 @@
 │   ├── funding_rate_service.py      # Получение funding rates
 │   ├── spread_analyzer.py           # Фильтрация по спредам
 │   ├── arbitrage_calculator.py      # Расчет возможностей арбитража
-│   ├── opportunity_monitor.py       # Мониторинг и исполнение (открытие/закрытие позиций)
+│   ├── opportunity_monitor.py       # 🆕 Мониторинг + докупки (monitor_additional_buys)
 │   └── order_executor.py            # Размещение ордеров (спот/фьючерс)
 │
 ├── /managers/
-│   ├── position_manager.py          # Управление позициями через репозитории (DI)
+│   ├── position_manager.py          # 🆕 Управление позициями + add_to_position()
 │   ├── blacklist_manager.py         # Управление blacklist через репозитории (DI)
 │   ├── leverage_manager.py          # Установка плеча
 │   └── balance.py                   # Получение балансов
@@ -98,6 +260,7 @@
 - Настройка SQLite (WAL mode, foreign keys)
 
 #### models.py - SQLAlchemy модели
+
 ```python
 class Position(Base):
     __tablename__ = 'positions'
@@ -112,7 +275,13 @@ class Position(Base):
     funding_payments_count = Column(Integer, default=0)
     low_fr_count = Column(Integer, default=0)
     consecutive_low_fr = Column(Boolean, default=False)
-    # ...
+
+    # 🆕 Поля для системы докупок
+    total_entries = Column(Integer, default=1)
+    average_spot_entry_price = Column(Float, nullable=True)
+    average_futures_entry_price = Column(Float, nullable=True)
+    last_addition_timestamp = Column(DateTime, nullable=True)
+    last_entry_spread_pct = Column(Float, nullable=True)
 
 class ClosedPosition(Base):
     __tablename__ = 'closed_positions'
@@ -122,6 +291,11 @@ class ClosedPosition(Base):
     close_timestamp = Column(DateTime, index=True)
     net_pnl = Column(Float)
     funding_pnl = Column(Float)
+
+    # 🆕 Поля для докупок в истории
+    total_entries = Column(Integer, default=1)
+    average_spot_entry_price = Column(Float, nullable=True)
+    average_futures_entry_price = Column(Float, nullable=True)
     # ...
 
 class Blacklist(Base):
@@ -143,10 +317,10 @@ class Blacklist(Base):
 - `get_all_open()` - все открытые позиции
 - `increment_funding_count()` - обновление счетчика фандинга
 - `delete_by_crypto()` - удаление позиции
-- `update_position_quantities()` - обновление qty после докупки
+- `update_position()` - 🆕 обновление всех полей позиции (для докупок)
 
 **HistoryRepository** (`history_repository.py`)
-- `save_closed_position()` - сохранение закрытой позиции
+- `save_closed_position()` - сохранение закрытой позиции (с полями докупок)
 - `get_all_history()` - вся история
 - `get_history_by_crypto()` - история по конкретной криптовалюте
 - `get_recent_history()` - последние N закрытых позиций
@@ -160,399 +334,63 @@ class Blacklist(Base):
 - `get_all_details()` - все записи с деталями
 - `bulk_add()` - массовое добавление (для миграции)
 
-### 2. Telegram Bot Integration (telegram_bot/) 🆕
+### 2. Telegram Bot Integration (telegram_bot/)
 
 **Полнофункциональная интеграция с Telegram для уведомлений и управления**
 
 #### Архитектура
 - **bot.py**: Главный класс `TelegramBot` - управление жизненным циклом бота
-- **handlers.py**: Command handlers - обработка пользовательских команд
-- **formatters.py**: Message formatters - форматирование данных для Telegram
+- **handlers.py**: Command handlers - обработка пользовательских команд (🆕 с поддержкой докупок)
+- **formatters.py**: Message formatters - форматирование данных для Telegram (🆕 отображение докупок)
 - **notifications.py**: Notification service - отправка уведомлений о событиях
 - **config.py**: Конфигурация (токен бота, admin chat IDs)
 
-#### TelegramBot (bot.py)
+#### 🆕 Обновленные форматеры (formatters.py)
 
-**Главный класс для управления Telegram ботом**
-
-```python
-class TelegramBot:
-    def __init__(
-        self,
-        position_repo: Optional[PositionRepository] = None,
-        history_repo: Optional[HistoryRepository] = None,
-        blacklist_repo: Optional[BlacklistRepository] = None
-    ):
-        # Dependency Injection репозиториев
-        self.position_repo = position_repo or PositionRepository()
-        self.history_repo = history_repo or HistoryRepository()
-        self.blacklist_repo = blacklist_repo or BlacklistRepository()
-
-        # Создание handlers с доступом к репозиториям
-        self.handlers = CommandHandlers(...)
-
-        # Создание Application
-        self.application = Application.builder().token(BOT_TOKEN).build()
-
-    def start(self) -> bool:
-        # Запускает бота в отдельном daemon thread
-        # Использует asyncio.new_event_loop() для совместимости с threading
-
-    def stop(self) -> None:
-        # Корректное завершение работы бота
-```
-
-**Особенности реализации**:
-- Запуск в отдельном daemon thread (не блокирует основной процесс)
-- Использование `asyncio.new_event_loop()` для работы в non-main thread
-- Dependency Injection репозиториев для доступа к данным
-- Graceful shutdown с ожиданием завершения потока
-
-#### Command Handlers (handlers.py)
-
-**Обработчики пользовательских команд**
+**`format_positions_list()`** - отображение открытых позиций с докупками
 
 ```python
-class CommandHandlers:
-    async def start(update, context):
-        # Приветственное сообщение + список команд
+def format_positions_list(positions: List[Dict[str, Any]]) -> str:
+    """
+    Форматирует список открытых позиций.
 
-    async def status(update, context):
-        # Статус системы:
-        # - Время работы
-        # - Количество открытых позиций
-        # - Размер blacklist
-        # - Доступные слоты для новых позиций
-
-    async def positions(update, context):
-        # Список открытых позиций:
-        # - Crypto symbol
-        # - Время входа + длительность
-        # - Цены входа (спот/фьючерс)
-        # - Количества
-        # - Спред входа
-
-    async def stats(update, context):
-        # Статистика торговли:
-        # - Общее количество сделок
-        # - Прибыльные/убыточные
-        # - Win rate
-        # - Total PnL
-        # - Average PnL
-        # - Лучшая/худшая сделка
+    🆕 НОВОЕ: Отображает информацию о докупках
+    - total_entries: количество входов
+    - average_spot_entry_price: усредненная цена спота
+    - average_futures_entry_price: усредненная цена фьючерса
+    """
+    # Проверяет total_entries
+    if total_entries > 1:
+        # Показывает "Входов: 3"
+        # Показывает усредненные цены
+    else:
+        # Обычный вид без докупок
 ```
 
-**Пример вывода `/positions`:**
+**Пример вывода:**
 ```
 📍 ОТКРЫТЫЕ ПОЗИЦИИ (1)
 
-1. BOBA
-├─ Вход: 05.01 16:05 (1ч 15мин назад)
-├─ Спот: 0.042540 USDT (qty: 703.9406)
-├─ Фьючерс: 0.042740 USDT (qty: 701.9000)
-└─ Спред: 0.47%
-```
-
-**Пример вывода `/stats`:**
-```
-📊 Статистика торговли
-
-🔢 Сделки: 12
-✅ Прибыльных: 10 (83.3%)
-❌ Убыточных: 2 (16.7%)
-
-💰 Финансы
-• Общая прибыль: +45.80 USDT
-• Средняя прибыль: +3.82 USDT
-• Лучшая сделка: +8.50 USDT
-• Худшая сделка: -2.10 USDT
-```
-
-#### Notification Service (notifications.py)
-
-**Автоматические уведомления о торговых событиях**
-
-```python
-class TelegramNotificationService:
-    def notify_position_opened(self, position_data: Dict):
-        # Уведомление об открытии позиции
-        # - Crypto symbol
-        # - Цены входа (спот/фьючерс)
-        # - Количества
-        # - Спред входа
-        # - Funding rate
-
-    def notify_position_closed(self, position_data: Dict):
-        # Уведомление о закрытии позиции
-        # - Crypto symbol
-        # - Длительность позиции
-        # - Spot PnL
-        # - Futures PnL
-        # - Funding PnL
-        # - Commission
-        # - Net PnL
-
-    def notify_critical_error(self, error_data: Dict):
-        # 🚨 КРИТИЧЕСКОЕ уведомление
-        # Используется когда фьючерс открыт, но спот не открылся
-        # - Тип ошибки
-        # - Crypto symbol
-        # - Qty фьючерса для ручного закрытия
-        # - Текст ошибки
-
-    def notify_blacklist_added(self, crypto: str, reason: str, error_code: int):
-        # Уведомление о добавлении в blacklist
-        # - Crypto symbol
-        # - Причина
-        # - Код ошибки (если есть)
-```
-
-**Пример уведомления об открытии:**
-```
-🟢 Позиция открыта
-
-💼 BOBA
-• Спот: 0.042540 USDT (qty: 703.94)
-• Фьючерс: 0.042740 USDT (qty: 701.90)
-• Спред: 0.47%
-• Funding Rate: 0.11%
-```
-
-**Пример уведомления о закрытии:**
-```
-🔴 Позиция закрыта
-
-💼 BOBA
-⏱ Время: 2ч 15мин
-
-💰 PnL
-• Спот: +1.25 USDT
-• Фьючерс: +0.80 USDT
-• Фандинг: +0.45 USDT
-• Комиссии: -0.62 USDT
-• Чистая прибыль: +1.88 USDT
-```
-
-**Пример критического уведомления:**
-```
-🚨 КРИТИЧЕСКАЯ ОШИБКА
-
-⚠️ Тип: Фьючерс открыт, спот не открылся
-
-💼 BOBA
-• Qty: 701.9000
-• Ошибка: Insufficient balance
-
-🔴 НЕОБХОДИМО ВРУЧНУЮ ЗАКРЫТЬ ФЬЮЧЕРС!
-```
-
-#### TelegramIntegration (integration/telegram_integration.py)
-
-**Singleton для глобального доступа к Telegram боту**
-
-```python
-class TelegramIntegration:
-    _instance = None  # Singleton
-
-    def __init__(self):
-        self.telegram_bot = TelegramBot(
-            position_repo=PositionRepository(),
-            history_repo=HistoryRepository(),
-            blacklist_repo=BlacklistRepository()
-        )
-        self.notification_service = TelegramNotificationService(...)
-
-    def start_bot(self) -> bool:
-        return self.telegram_bot.start()
-
-    def stop_bot(self):
-        self.telegram_bot.stop()
-
-    def notify_position_opened(self, **kwargs):
-        self.notification_service.notify_position_opened(kwargs)
-
-    def notify_position_closed(self, **kwargs):
-        self.notification_service.notify_position_closed(kwargs)
-
-    # ... другие методы уведомлений
-
-# Глобальный доступ
-def get_telegram_integration() -> Optional[TelegramIntegration]:
-    return TelegramIntegration.get_instance()
-```
-
-**Использование в opportunity_monitor.py:**
-```python
-from integration.telegram_integration import get_telegram_integration
-
-# При открытии позиции
-telegram = get_telegram_integration()
-if telegram:
-    telegram.notify_position_opened(
-        crypto=crypto,
-        spot_entry_price=spot_ask,
-        futures_entry_price=futures_bid,
-        spot_qty=purchased_qty,
-        entry_spread_pct=spread_pct,
-        funding_rate=funding_rate
-    )
-
-# При закрытии позиции
-if telegram:
-    telegram.notify_position_closed(
-        crypto=crypto,
-        entry_time=entry_timestamp,
-        close_time=close_timestamp,
-        spot_pnl=pnl_result['spot_pnl'],
-        futures_pnl=pnl_result['futures_pnl'],
-        funding=pnl_result['funding'],
-        commission=pnl_result['commission'],
-        net_pnl=pnl_result['net_pnl']
-    )
-
-# При критической ошибке
-if telegram:
-    telegram.notify_critical_error(
-        error_type='futures_opened_spot_failed',
-        message=f"Спот ошибка: {spot_result['error']}",
-        crypto=crypto,
-        qty=futures_result['qty']
-    )
-```
-
-#### Конфигурация Telegram (telegram_bot/config.py)
-
-```python
-class TelegramConfig:
-    # Токен бота (получить у @BotFather)
-    BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '7534003941:AAEib...')
-
-    # Admin chat IDs (для получения уведомлений)
-    ADMIN_CHAT_IDS = [
-        # 123456789,  # Твой chat_id (получить через /start)
-    ]
-
-    # Настройки
-    MESSAGE_TIMEOUT = 30  # Таймаут отправки сообщений
-    ENABLE_NOTIFICATIONS = True  # Включить уведомления
-    NOTIFICATION_COOLDOWN = 5  # Минимальный интервал между уведомлениями (сек)
-```
-
-**Как получить chat_id:**
-1. Создать бота через @BotFather → получить токен
-2. Запустить бота: `python main.py`
-3. Написать `/start` в Telegram
-4. В логах увидеть: `[TELEGRAM] Пользователь 123456789 (@username) отправил /start`
-5. Добавить `123456789` в `ADMIN_CHAT_IDS`
-6. Перезапустить бота
-
-#### Интеграция с Orchestrator
-
-```python
-# orchestrator.py
-from integration.telegram_integration import TelegramIntegration
-
-class MultiCryptoOrchestrator:
-    def __init__(self):
-        # ... инициализация репозиториев и менеджеров ...
-
-        # Инициализация Telegram интеграции
-        self.telegram = TelegramIntegration(
-            position_repo=self.position_repo,
-            history_repo=self.history_repo,
-            blacklist_repo=self.blacklist_repo
-        )
-        logger.info("✅ Telegram интеграция инициализирована")
-
-    def run(self):
-        try:
-            # Запуск Telegram бота
-            if self.telegram.start_bot():
-                logger.info("✅ Telegram бот запущен")
-            else:
-                logger.warning("⚠️ Telegram бот не запущен")
-
-            # ... основной цикл торговли ...
-
-        finally:
-            # Остановка Telegram бота при завершении
-            self.telegram.stop_bot()
-```
-
-#### Отключение шумных логов
-
-**В utils/logger_config.py:**
-```python
-def setup_logging():
-    # ... основная настройка ...
-
-    # Отключаем шумные HTTP логи от Telegram
-    logging.getLogger('httpx').setLevel(logging.WARNING)
-    logging.getLogger('telegram').setLevel(logging.WARNING)
-    logging.getLogger('telegram.ext').setLevel(logging.WARNING)
-    logging.getLogger('httpcore').setLevel(logging.WARNING)
-
-    return logger
-```
-
-Это предотвращает спам в логах вида:
-```
-INFO - HTTP Request: POST https://api.telegram.org/bot.../sendMessage "HTTP/1.1 200 OK"
-INFO - HTTP Request: POST https://api.telegram.org/bot.../getUpdates "HTTP/1.1 200 OK"
+1. BTC
+├─ Вход: 07.01 16:05 (2ч 15мин назад)
+├─ 🔢 Входов: 3
+├─ 📊 Усредненные цены:
+│   ├─ Спот: 45150.234567 USDT
+│   └─ Фьюч: 45350.123456 USDT
+├─ Спот qty: 0.066
+├─ Фьючерс qty: 0.065
+└─ Спред: 0.75%
 ```
 
 ### 3. MultiCryptoOrchestrator (orchestrator.py)
 
 **Главный координатор с Dependency Injection**
 
-#### Инициализация
-```python
-def __init__(self):
-    # Проверка подключения к БД
-    if not check_db_connection():
-        raise RuntimeError("Database connection failed")
-
-    # Создание репозиториев
-    self.position_repo = PositionRepository()
-    self.history_repo = HistoryRepository()
-    self.blacklist_repo = BlacklistRepository()
-
-    # Dependency Injection в менеджеры
-    self.position_manager = MultiPositionManager(
-        position_repo=self.position_repo,
-        history_repo=self.history_repo
-    )
-
-    self.blacklist_manager = BlacklistManager(
-        blacklist_repo=self.blacklist_repo
-    )
-
-    # Telegram интеграция
-    self.telegram = TelegramIntegration(
-        position_repo=self.position_repo,
-        history_repo=self.history_repo,
-        blacklist_repo=self.blacklist_repo
-    )
-```
-
-#### Сканирование рынка (`scan_opportunities`)
-- Получает список всех торговых пар с Bybit
-- Фильтрует blacklist криптовалюты (через БД)
-- Анализирует спреды через `SpreadAnalyzer`
-- Получает funding rates
-- Находит топ-N прибыльных возможностей
-- Запускает потоки открытия позиций
-
-#### Мониторинг позиций (`monitor_position`)
-- Каждая открытая позиция мониторится в отдельном daemon-потоке
-- Проверяет условия закрытия каждые 300 секунд
-- Поддерживает 2 режима закрытия:
-  - **Обычный**: FR < -0.001% И спред <= 0.15%
-  - **Мягкий**: FR <= 0.005% И спред <= 0.15% (после 15+ раундов с низким FR)
+*(Без изменений - система докупок работает внутри потоков мониторинга)*
 
 ### 4. OpportunityMonitor (opportunity_monitor.py)
 
-**Логика торговли**: открытие и закрытие позиций
+**🆕 Логика торговли с поддержкой докупок**
 
 #### Открытие позиции (`monitor_and_execute`)
 ```
@@ -566,11 +404,62 @@ def __init__(self):
 3️⃣ Открытие СПОТА (LONG)
    ⚠️ Если спот не открылся → КРИТИЧЕСКАЯ СИТУАЦИЯ → Telegram уведомление
 4️⃣ Сохранение в БД через position_manager.save_position()
-5️⃣ Telegram уведомление об успешном открытии
+5️⃣ 🆕 Запуск потока докупок (если ENABLE_POSITION_ADDITIONS = True)
+6️⃣ Telegram уведомление об успешном открытии
+```
+
+#### 🆕 Мониторинг докупок (`monitor_additional_buys`)
+
+```python
+@staticmethod
+def monitor_additional_buys(crypto: str, position_manager) -> None:
+    """
+    Параллельный мониторинг докупок для открытой позиции.
+
+    УСЛОВИЯ ДОКУПКИ:
+    - Спред вырос на +0.15% от последнего входа
+    - Прошло минимум 5 минут (300 сек) с последней докупки
+    - Максимум 3 докупки (итого 4 входа)
+
+    Работает в отдельном daemon thread:
+    - Запускается из monitor_open_position_single()
+    - Проверяет условия каждые 5 минут (300 сек)
+    - Завершается когда позиция закрыта или достигнут лимит
+
+    Порядок докупки:
+    1️⃣ Проверка позиции существует
+    2️⃣ Проверка лимита (total_entries <= MAX_POSITION_ADDITIONS)
+    3️⃣ Проверка cooldown (300 сек с last_addition_timestamp)
+    4️⃣ Проверка спреда (current >= last + 0.15%)
+    5️⃣ Открытие фьючерса (SHORT)
+    6️⃣ Открытие спота (LONG)
+    7️⃣ Обновление позиции через add_to_position()
+    """
+```
+
+**Пример логов:**
+```
+[BTC] 🔄 Запущен мониторинг докупок (макс. 3 докупок)
+[BTC] [Попытка 12] Вход #1: Текущий спред 0.58%, Целевой 0.60% (+0.15%)
+[BTC] ========================================
+[BTC] 🎯 УСЛОВИЯ ДОКУПКИ ВЫПОЛНЕНЫ!
+[BTC] Вход #2
+[BTC] Текущий спред: 0.62% >= 0.60%
+[BTC] Последний вход был при спреде: 0.45%
+[BTC] ========================================
+[BTC] 📍 ШАГ 1/2: Докупка ФЬЮЧЕРС...
+[BTC] ✅ Фьючерс докуплен: OrderID 12345
+[BTC] 📍 ШАГ 2/2: Докупка СПОТ...
+[BTC] ✅ Спот докуплен: OrderID 67890
+[BTC] ✅ Докупка #1 успешно обработана
+[BTC] Cooldown на следующие 300 секунд
 ```
 
 #### Закрытие позиции (`monitor_open_position_single`)
+
 ```
+🆕 ИЗМЕНЕНО: Использует усредненные цены для расчета PnL
+
 Обычный режим:
 - FR < -0.001% (CLOSE_FR_THRESHOLD)
 - Спред закрытия <= 0.15% (MAX_CLOSE_SPREAD_PCT)
@@ -582,93 +471,129 @@ def __init__(self):
 Порядок закрытия:
 1️⃣ Продажа СПОТА (по актуальному балансу)
 2️⃣ Покупка ФЬЮЧЕРСА (по сохраненному qty)
-3️⃣ Сохранение в историю через history_repo.save_closed_position()
-4️⃣ Telegram уведомление о закрытии с PnL
+3️⃣ Расчет PnL с использованием average_entry_prices
+4️⃣ Сохранение в историю через history_repo.save_closed_position()
+5️⃣ Telegram уведомление о закрытии с PnL
 ```
 
 ### 5. MultiPositionManager (position_manager.py)
 
-**Управление множественными позициями через репозитории**
+**🆕 Управление позициями с поддержкой докупок**
 
-#### Dependency Injection
+#### Новый метод: `add_to_position()`
+
 ```python
-def __init__(
+@synchronized_save
+def add_to_position(
     self,
-    position_repo: Optional[PositionRepository] = None,
-    history_repo: Optional[HistoryRepository] = None
-):
-    self.position_repo = position_repo or PositionRepository()
-    self.history_repo = history_repo or HistoryRepository()
-    # ...
+    crypto: str,
+    new_spot_price: float,
+    new_futures_price: float,
+    new_spot_qty: float,
+    new_futures_qty: float,
+    new_spread_pct: float
+) -> bool:
+    """
+    Докупка к существующей позиции с усреднением цен.
+
+    Thread-safe: использует @synchronized_save декоратор
+
+    Алгоритм:
+    1. Получает текущую позицию из репозитория
+    2. Рассчитывает weighted average для цен:
+       new_avg = (old_avg * old_qty + new_price * new_qty) / (old_qty + new_qty)
+    3. Суммирует количества
+    4. Обновляет метаданные:
+       - total_entries += 1
+       - last_addition_timestamp = now()
+       - last_entry_spread_pct = new_spread_pct
+       - average_spot_entry_price = calculated
+       - average_futures_entry_price = calculated
+    5. Сохраняет через position_repo.update_position()
+
+    Returns:
+        bool: True если успешно обновлено
+    """
 ```
 
-#### Ключевые методы
-- `save_position()` - сохранение позиции через репозиторий
-- `get_position(crypto)` - получение данных позиции (dict для совместимости)
-- `has_position(crypto)` - проверка существования
-- `increment_funding_count()` - отслеживание funding rate для мягкого режима
-- `close_position_with_pnl()` - закрытие с расчетом PnL и сохранение в историю
-- `get_all_positions()` - все открытые позиции (Dict[str, dict])
-- `get_open_cryptos()` - список символов с открытыми позициями
+**Пример:**
+```python
+# Вход 1 (начальный)
+save_position(
+    crypto="BTC",
+    spot_price=45000.0,
+    spot_qty=0.022,
+    futures_price=45200.0,
+    futures_qty=0.022,
+    spread_pct=0.45
+)
+# → total_entries=1, avg_spot=45000, avg_futures=45200
 
-#### Thread Safety
-- Используется `threading.RLock` (реентерабельный lock)
-- Все операции атомарны
-- Безопасная работа из множественных потоков
+# Докупка 1
+add_to_position(
+    crypto="BTC",
+    new_spot_price=45100.0,
+    new_spot_qty=0.022,
+    new_futures_price=45300.0,
+    new_futures_qty=0.022,
+    new_spread_pct=0.60
+)
+# → total_entries=2
+# → avg_spot = (45000*0.022 + 45100*0.022) / 0.044 = 45050
+# → avg_futures = (45200*0.022 + 45300*0.022) / 0.044 = 45250
+```
+
+#### Обновленные методы
+
+**`save_position()`** - инициализирует поля докупок при создании:
+```python
+total_entries=1,
+average_spot_entry_price=None,  # Будет заполнено при первой докупке
+average_futures_entry_price=None,
+last_addition_timestamp=None,
+last_entry_spread_pct=spot_price  # Для расчета следующей докупки
+```
+
+**`close_position_with_pnl()`** - использует усредненные цены для PnL:
+```python
+# Если есть докупки (total_entries > 1)
+entry_spot = position.average_spot_entry_price or position.spot_entry_price
+entry_futures = position.average_futures_entry_price or position.futures_entry_price
+
+# Расчет PnL
+pnl_result = PnLCalculator.calculate_pnl(
+    entry_spot_price=entry_spot,
+    entry_futures_price=entry_futures,
+    close_spot_price=close_spot_price,
+    close_futures_price=close_futures_price,
+    spot_qty=position.spot_qty,
+    futures_qty=position.futures_qty,
+    funding_pnl=funding_pnl
+)
+```
 
 ### 6. BlacklistManager (blacklist_manager.py)
 
 **Singleton-менеджер с кешированием в памяти**
 
-#### Dependency Injection + Caching
-```python
-def __init__(self, blacklist_repo: Optional[BlacklistRepository] = None):
-    self.blacklist_repo = blacklist_repo or BlacklistRepository()
-
-    # Кеш для быстрого доступа
-    self.blacklist: Set[str] = set()
-    self.blacklist_details = {}
-
-    # Загрузка из БД в кеш
-    self._load_blacklist()
-```
-
-#### Критические коды ошибок (автоматическое добавление в blacklist)
-```python
-CRITICAL_ERROR_CODES = [
-    30228,  # No new positions during delisting
-    10001,  # Symbol not found
-    110043, # Set margin mode failed (suspended trading)
-]
-```
-
-#### Ключевые методы
-- `add_to_blacklist()` - добавление в БД + обновление кеша + Telegram уведомление
-- `is_blacklisted()` - быстрая проверка через кеш
-- `remove_from_blacklist()` - удаление из БД + обновление кеша
-- `get_blacklist()` - копия списка
-- `refresh_cache()` - принудительное обновление кеша из БД
+*(Без изменений)*
 
 ### 7. OrderExecutor (order_executor.py)
 
 **Исполнение ордеров с точностью инструмента**
 
-#### Ключевые функции
-- `get_instrument_info()` - получение `qtyStep`, `basePrecision`, `minOrderQty`
-- `round_to_step()` - округление qty с использованием Decimal (ROUND_DOWN)
-- `place_spot_order()` - Market ордер на спот (в USDT, `marketUnit: quoteCoin`)
-- `place_futures_order()` - Market ордер на фьючерс (в qty монеты)
-- `close_spot_position_qty()` - закрытие спота (по актуальному балансу)
-- `close_futures_position()` - закрытие фьючерса (reduceOnly=True)
+*(Без изменений)*
 
 ### 8. PnLCalculator (pnl_calculator.py)
 
 **Расчет прибыли/убытка при закрытии позиции**
 
-#### Формула
-```
-Spot PnL = (exit_price - entry_price) * spot_qty
-Futures PnL = (entry_price - exit_price) * futures_qty
+#### 🆕 Обновлено для работы с усредненными ценами
+
+```python
+# Формула (с усредненными ценами)
+Spot PnL = (exit_price - entry_avg_price) * spot_qty
+Futures PnL = (entry_avg_price - exit_price) * futures_qty
 Price PnL = Spot PnL + Futures PnL
 Commission = (entry_value + exit_value) * commission_rate
 Net PnL = Price PnL + Funding - Commission
@@ -678,21 +603,13 @@ Net PnL = Price PnL + Funding - Commission
 
 **Расчет РЕАЛЬНОГО полученного фандинга через Bybit API**
 
-#### Метод
-- Запрашивает `/execution/list` с `execType: "Funding"`
-- Разбивает период на интервалы по 7 дней (API ограничение)
-- Суммирует все `execFee` (с инвертированием знака)
-- Положительное число = прибыль от фандинга
+*(Без изменений)*
 
 ### 10. Rate Limiter (rate_limiter.py)
 
 **Token Bucket алгоритм для защиты от rate limit**
 
-#### Лимиты Bybit
-```python
-MAX_REQUESTS_PER_SECOND = 50  # (Bybit: 120)
-MAX_WEIGHT_PER_SECOND = 300   # (Bybit: 600)
-```
+*(Без изменений)*
 
 ## Конфигурация (config.py)
 
@@ -718,6 +635,42 @@ MIN_FUNDING_PAYMENTS_FOR_CLOSE = 15  # Раундов с низким FR для 
 MAX_CLOSE_SPREAD_PCT = 0.15      # Максимальный спред для закрытия
 ```
 
+### 🆕 Параметры докупок позиций
+
+```python
+# ========================================
+# 🆕 НОВОЕ: Параметры докупки позиций
+# ========================================
+
+# Включить/выключить систему докупок
+ENABLE_POSITION_ADDITIONS = True
+
+# Максимальное количество докупок на позицию (не включая начальный вход)
+MAX_POSITION_ADDITIONS = 3  # Итого: 1 начальный + 3 докупки = 4 входа
+
+# Минимальный прирост спреда для следующей докупки (%)
+# Пример: если вход был на 0.45%, то докупка будет на 0.60% (0.45 + 0.15)
+ADDITION_SPREAD_INCREMENT = 0.15
+
+# Минимальное время между докупками (секунды)
+ADDITION_COOLDOWN_SEC = 300  # 5 минут
+
+# Минимальный FR для докупки (должен быть > 0)
+MIN_FUNDING_RATE_FOR_ADDITION = 0.0
+```
+
+**Пояснение констант:**
+
+- **`ENABLE_POSITION_ADDITIONS`**: Включить/выключить систему докупок глобально
+- **`MAX_POSITION_ADDITIONS`**: Максимум докупок (не считая начальный вход)
+  - `3` означает: 1 начальный + 3 докупки = итого 4 входа
+- **`ADDITION_SPREAD_INCREMENT`**: Шаг спреда для следующей докупки
+  - Вход: 0.45% → Докупка 1: 0.60% → Докупка 2: 0.75% → Докупка 3: 0.90%
+- **`ADDITION_COOLDOWN_SEC`**: Минимальное время между докупками
+  - `300` = 5 минут между докупками
+- **`MIN_FUNDING_RATE_FOR_ADDITION`**: Минимальный FR для докупки
+  - `0.0` = докупаем при любом положительном FR
+
 ### Многопоточность
 ```python
 MAX_CONCURRENT_POSITIONS = 1  # Одновременных позиций
@@ -733,7 +686,7 @@ DATABASE_URL = "sqlite:///./arbitrage.db"  # SQLite файл
 
 ### Telegram Bot (telegram_bot/config.py)
 ```python
-BOT_TOKEN = "7534003941:AAEib2A0V-aY1ohtj7yam5Wm6_7U1hU5HAA"
+BOT_TOKEN = "your_bot_token_here"
 ADMIN_CHAT_IDS = []  # Добавить свой chat_id после /start
 ENABLE_NOTIFICATIONS = True
 MESSAGE_TIMEOUT = 30
@@ -762,7 +715,7 @@ BYBIT_API_KEY=your_api_key
 BYBIT_API_SECRET=your_api_secret
 
 # Telegram Bot
-TELEGRAM_BOT_TOKEN=7534003941:AAEib2A0V-aY1ohtj7yam5Wm6_7U1hU5HAA
+TELEGRAM_BOT_TOKEN=your_bot_token_here
 
 # База данных (опционально)
 DATABASE_URL=sqlite:///./arbitrage.db
@@ -779,6 +732,23 @@ alembic upgrade head
 # Миграция blacklist.json → БД (если есть старые данные)
 python scripts/migrate_blacklist_to_db.py
 ```
+
+### 🆕 Миграция для добавления полей докупок
+
+```bash
+# Создать новую миграцию
+alembic revision --autogenerate -m "add_position_additions_fields"
+
+# Применить миграцию
+alembic upgrade head
+```
+
+**Миграция добавит следующие колонки:**
+- `total_entries` (Integer, default=1)
+- `average_spot_entry_price` (Float, nullable)
+- `average_futures_entry_price` (Float, nullable)
+- `last_addition_timestamp` (DateTime, nullable)
+- `last_entry_spread_pct` (Float, nullable)
 
 ### Настройка Telegram бота
 
@@ -804,10 +774,11 @@ python scripts/migrate_blacklist_to_db.py
 
 #### 3. Проверка работы
 ```
-/start    - Приветствие + список команд
-/status   - Статус системы
-/positions - Открытые позиции
-/stats    - Статистика торговли
+/start     - Приветствие + список команд
+/status    - Статус системы
+/positions - Открытые позиции (🆕 с докупками)
+/stats     - Статистика торговли
+/history   - 🆕 История с количеством входов
 ```
 
 ### Запуск
@@ -817,12 +788,13 @@ python main.py
 
 **Ожидаемые логи:**
 ```
-2026-01-05 17:00:00 - INFO - 🔧 Инициализация оркестратора...
-2026-01-05 17:00:00 - INFO - ✅ Подключение к БД успешно
-2026-01-05 17:00:00 - INFO - ✅ Telegram интеграция инициализирована
-2026-01-05 17:00:00 - INFO - ✅ Telegram бот запущен
-2026-01-05 17:00:00 - INFO - 🚀 Запуск Telegram Bot polling...
-2026-01-05 17:00:01 - INFO - ✅ Telegram Bot polling запущен
+2026-01-07 20:00:00 - INFO - 🔧 Инициализация оркестратора...
+2026-01-07 20:00:00 - INFO - ✅ Подключение к БД успешно
+2026-01-07 20:00:00 - INFO - ✅ Telegram интеграция инициализирована
+2026-01-07 20:00:00 - INFO - ✅ Telegram бот запущен
+2026-01-07 20:00:00 - INFO - 🚀 Запуск Telegram Bot polling...
+2026-01-07 20:00:01 - INFO - ✅ Telegram Bot polling запущен
+2026-01-07 20:00:01 - INFO - [BTC] 🔄 Запущен поток мониторинга докупок
 ```
 
 ### Мониторинг (tmux)
@@ -841,18 +813,20 @@ python main.py
 
 ### Структура логов
 ```
-[2026-01-05 17:00:00] [INFO] 🔧 Инициализация оркестратора...
-[2026-01-05 17:00:00] [INFO] ✅ Telegram интеграция активна
-[2026-01-05 17:00:01] [INFO] [BTC] 🔍 Мониторинг закрытия...
-[2026-01-05 17:00:01] [INFO] [BTC] └─ FR 0.0150% >= -0.001%, ждем снижения FR
-[2026-01-05 17:05:00] [INFO] [BTC] 🔥 Условия закрытия выполнены
-[2026-01-05 17:05:01] [INFO] [BTC] ✅ Позиция успешно закрыта
-[2026-01-05 17:05:02] [INFO] 💰 NET PnL: +0.45 USDT ✅
+[2026-01-07 20:00:00] [INFO] 🔧 Инициализация оркестратора...
+[2026-01-07 20:00:00] [INFO] ✅ Telegram интеграция активна
+[2026-01-07 20:00:01] [INFO] [BTC] 🔍 Мониторинг закрытия...
+[2026-01-07 20:00:01] [INFO] [BTC] 🔄 Запущен поток мониторинга докупок
+[2026-01-07 20:05:00] [INFO] [BTC] 🎯 УСЛОВИЯ ДОКУПКИ ВЫПОЛНЕНЫ!
+[2026-01-07 20:05:01] [INFO] [BTC] ✅ Докупка #1 успешно обработана
+[2026-01-07 20:10:00] [INFO] [BTC] 🔥 Условия закрытия выполнены
+[2026-01-07 20:10:01] [INFO] [BTC] ✅ Позиция успешно закрыта
+[2026-01-07 20:10:02] [INFO] 💰 NET PnL: +2.45 USDT ✅ (3 входа)
 ```
 
 ### Уровни
 - `DEBUG`: Детальная информация (API запросы, SQL queries)
-- `INFO`: Основные события (открытие/закрытие, Telegram уведомления)
+- `INFO`: Основные события (открытие/закрытие, докупки, Telegram уведомления)
 - `WARNING`: Предупреждения (timeout, blacklist)
 - `ERROR`: Ошибки (API failures, БД проблемы)
 - `CRITICAL`: Критические ситуации (фьючерс открыт, спот не открыт)
@@ -876,6 +850,10 @@ logging.getLogger('telegram').setLevel(logging.WARNING)
 - [x] Real-time notifications о торговых событиях
 - [x] Command handlers (/start, /status, /positions, /stats)
 - [x] Критические уведомления (фьючерс открыт, спот не открылся)
+- [x] 🆕 Система докупок позиций (Position Pyramiding)
+- [x] 🆕 Weighted average цен входа
+- [x] 🆕 Отображение докупок в Telegram (/positions, /history)
+- [x] 🆕 Parallel thread monitoring для докупок
 
 ### TODO
 - [ ] Web dashboard для мониторинга (FastAPI + React)
@@ -885,6 +863,8 @@ logging.getLogger('telegram').setLevel(logging.WARNING)
 - [ ] PostgreSQL support для production
 - [ ] Telegram команды для управления (/close, /blacklist add/remove)
 - [ ] Графики PnL в Telegram
+- [ ] Адаптивный increment спреда (динамический 0.15%)
+- [ ] Стоп-лосс для докупок
 
 ### Известные ограничения
 - Максимум 1 одновременная позиция (можно увеличить в config)
@@ -892,8 +872,74 @@ logging.getLogger('telegram').setLevel(logging.WARNING)
 - Funding rate обновляется каждые 8 часов (00:00, 08:00, 16:00 UTC)
 - SQLite не подходит для очень высокой нагрузки (миграция на PostgreSQL)
 - Telegram бот работает в daemon thread (завершается при остановке основного процесса)
+- 🆕 Система докупок работает только при положительном FR
 
 ## FAQ
+
+### 🆕 Как работает система докупок?
+
+**Короткий ответ**: При росте спреда на +0.15% бот автоматически докупает такой же объем, усредняя цену входа.
+
+**Подробно**:
+1. Позиция открывается при спреде 0.45%
+2. Запускается параллельный поток мониторинга докупок
+3. Каждые 5 минут проверяется: спред >= последний спред + 0.15%?
+4. Если да → докупка (фьючерс + спот)
+5. Усреднение цен: `new_avg = (old_avg * old_qty + new_price * new_qty) / total_qty`
+6. Максимум 3 докупки (итого 4 входа)
+7. При закрытии PnL считается от усредненных цен
+
+### 🆕 Как отключить систему докупок?
+
+```python
+# config.py
+ENABLE_POSITION_ADDITIONS = False
+```
+
+Бот будет работать в обычном режиме (1 вход на позицию).
+
+### 🆕 Как изменить параметры докупок?
+
+```python
+# config.py
+
+# Больше докупок (осторожно: больше риск!)
+MAX_POSITION_ADDITIONS = 5  # Было 3
+
+# Более частые докупки (меньший прирост спреда)
+ADDITION_SPREAD_INCREMENT = 0.10  # Было 0.15
+
+# Более короткий cooldown
+ADDITION_COOLDOWN_SEC = 180  # Было 300 (3 минуты вместо 5)
+```
+
+⚠️ **РИСКИ**:
+- Больше входов = больше экспозиция
+- Меньший increment = чаще докупки = больше комиссий
+- Короткий cooldown = меньше времени на анализ
+
+### 🆕 Как посмотреть позиции с докупками?
+
+```
+/positions - покажет количество входов и усредненные цены
+/history   - покажет закрытые позиции с количеством входов
+```
+
+### 🆕 Влияют ли докупки на расчет PnL?
+
+**Да!** PnL считается от усредненных цен:
+
+```python
+# Без докупок
+entry_price = 45000
+exit_price = 45500
+pnl = (45500 - 45000) * qty = +500
+
+# С докупками (3 входа)
+avg_entry_price = 45150  # Усреднено
+exit_price = 45500
+pnl = (45500 - 45150) * total_qty = больше прибыли при большем объеме!
+```
 
 ### Почему сначала открывается фьючерс, а не спот?
 
@@ -908,6 +954,8 @@ logging.getLogger('telegram').setLevel(logging.WARNING)
 # config.py
 TRADE_AMOUNT_USD = 50.0  # Было 30.0
 ```
+
+**⚠️ При докупках**: Каждая докупка использует тот же `TRADE_AMOUNT_USD`, то есть итоговая экспозиция = `TRADE_AMOUNT_USD * (1 + MAX_POSITION_ADDITIONS)`
 
 ### Как увеличить количество одновременных позиций?
 
@@ -924,6 +972,7 @@ MAX_CONCURRENT_POSITIONS = 3  # Было 1
 2. Он автоматически восстановит мониторинг открытых позиций из БД
 3. Проверить логи на ошибки
 4. Проверить Telegram - придет уведомление о восстановлении
+5. 🆕 Потоки докупок автоматически перезапустятся для открытых позиций
 
 ### Почему не приходят Telegram уведомления?
 
@@ -974,10 +1023,11 @@ python main.py
 
 ---
 
-**Версия документации**: 5.0 (Telegram Edition)  
+**Версия документации**: 6.0 (Pyramiding Edition) 🆕  
 **Дата обновления**: Январь 2026  
 **Автор проекта**: Александр  
 **Exchange**: Bybit  
-**Strategy**: Spot-Futures Arbitrage (Cash & Carry)  
+**Strategy**: Spot-Futures Arbitrage (Cash & Carry) + Position Pyramiding  
 **Storage**: SQLite (SQLAlchemy ORM) + Alembic Migrations  
-**Notifications**: Telegram Bot (python-telegram-bot v20+)
+**Notifications**: Telegram Bot (python-telegram-bot v20+)  
+**New Feature**: Automated Position Additions with Weighted Average Pricing 🎯
