@@ -52,6 +52,18 @@ class OpportunityMonitor:
         # Пауза 10 секунд после открытия позиции перед первой проверкой
         logger.info(f"[{crypto}] ⏸️ Пауза 10 секунд после открытия позиции...")
         time.sleep(10)
+        # 🆕 Запускаем параллельный мониторинг докупок в отдельном потоке
+        from config import ENABLE_ADDITIONAL_BUYS
+        if ENABLE_ADDITIONAL_BUYS:
+            import threading
+            additional_buy_thread = threading.Thread(
+                target=OpportunityMonitor.monitor_additional_buys,
+                args=(crypto, position_manager),
+                daemon=True,
+                name=f"AdditionalBuys-{crypto}"
+            )
+            additional_buy_thread.start()
+            logger.info(f"[{crypto}] 🔄 Запущен поток мониторинга докупок")
 
         attempts = 0
         max_attempts = 1000
@@ -189,6 +201,165 @@ class OpportunityMonitor:
 
         logger.warning(f"[{crypto}] ⏱️ Время мониторинга истекло ({max_attempts} попыток)")
         return False
+    
+    @staticmethod
+    def monitor_additional_buys(crypto: str, position_manager) -> None:
+        """
+        🆕 Параллельный мониторинг докупок для открытой позиции.
+        
+        УСЛОВИЯ ДОКУПКИ:
+        - Спред вырос на +0.15% от последнего входа
+        - Прошло минимум 5 минут с последней докупки
+        - Максимум 3 докупки (итого 4 входа)
+        
+        УРОВНИ СПРЕДА:
+        - Вход 1: 0.45%
+        - Докупка 1: 0.60% (+0.15%)
+        - Докупка 2: 0.75% (+0.15%)
+        - Докупка 3: 0.90% (+0.15%)
+        
+        Args:
+            crypto: Символ криптовалюты
+            position_manager: Менеджер позиций
+        """
+        from config import (
+            ADDITIONAL_BUY_SPREAD_INCREMENT,
+            ADDITIONAL_BUY_COOLDOWN_MINUTES,
+            MAX_ADDITIONAL_BUYS
+        )
+        from datetime import datetime, timedelta
+        
+        logger.info(f"[{crypto}] 🔄 Запущен мониторинг докупок (макс. {MAX_ADDITIONAL_BUYS} докупок)")
+        
+        max_monitoring_attempts = 500  # ~41 час при интервале 300 сек
+        attempts = 0
+        
+        while attempts < max_monitoring_attempts:
+            attempts += 1
+            time.sleep(300)  # Проверка каждые 5 минут
+            
+            # Проверяем что позиция еще существует
+            position = position_manager.get_position(crypto)
+            if not position:
+                logger.info(f"[{crypto}] Позиция закрыта, завершаем мониторинг докупок")
+                return
+            
+            total_entries = position.get('total_entries', 1)
+            
+            # Проверка максимального количества докупок
+            if total_entries > MAX_ADDITIONAL_BUYS:
+                logger.info(f"[{crypto}] Достигнут лимит докупок ({MAX_ADDITIONAL_BUYS}), завершаем мониторинг")
+                return
+            
+            # Проверяем cooldown с последней докупки
+            last_addition_timestamp = position.get('last_addition_timestamp')
+            if last_addition_timestamp:
+                time_since_last = datetime.now() - last_addition_timestamp
+                cooldown_remaining = timedelta(minutes=ADDITIONAL_BUY_COOLDOWN_MINUTES) - time_since_last
+                
+                if cooldown_remaining.total_seconds() > 0:
+                    minutes_remaining = int(cooldown_remaining.total_seconds() / 60)
+                    logger.debug(
+                        f"[{crypto}] Cooldown активен, осталось {minutes_remaining} мин "
+                        f"(вход #{total_entries})"
+                    )
+                    continue
+            
+            # Получаем текущий спред
+            spot_ob = PriceFetcher.get_orderbook(crypto, "spot")
+            fut_ob = PriceFetcher.get_orderbook(crypto, "linear")
+            
+            if not spot_ob or not fut_ob:
+                logger.warning(f"[{crypto}] Не удалось получить orderbook для докупки")
+                continue
+            
+            spot_ask = spot_ob.get('ask')
+            futures_bid = fut_ob.get('bid')
+            
+            if not spot_ask or not futures_bid:
+                logger.warning(f"[{crypto}] Нет ASK/BID для докупки")
+                continue
+            
+            # Рассчитываем текущий спред
+            current_spread = (futures_bid - spot_ask) / spot_ask * 100
+            
+            # Получаем спред последнего входа
+            last_entry_spread = position.get('last_entry_spread_pct', position.get('entry_spread_pct'))
+            
+            # Рассчитываем целевой спред для следующей докупки
+            target_spread = last_entry_spread + ADDITIONAL_BUY_SPREAD_INCREMENT
+            
+            logger.debug(
+                f"[{crypto}] [Попытка {attempts}] Вход #{total_entries}: "
+                f"Текущий спред {current_spread:.4f}%, "
+                f"Целевой {target_spread:.4f}% (+{ADDITIONAL_BUY_SPREAD_INCREMENT:.2f}%)"
+            )
+            
+            # Проверяем условие докупки
+            if current_spread >= target_spread:
+                logger.info("=" * 70)
+                logger.info(f"[{crypto}] 🎯 УСЛОВИЯ ДОКУПКИ ВЫПОЛНЕНЫ!")
+                logger.info(f"[{crypto}] Вход #{total_entries + 1}")
+                logger.info(f"[{crypto}] Текущий спред: {current_spread:.4f}% >= {target_spread:.4f}%")
+                logger.info(f"[{crypto}] Последний вход был при спреде: {last_entry_spread:.4f}%")
+                logger.info("=" * 70)
+                
+                # Рассчитываем размер докупки (такой же как первоначальная позиция)
+                actual_trade_amount = OrderExecutor.calculate_futures_amount(
+                    crypto, futures_bid, OrderExecutor.TRADE_AMOUNT_USD
+                )
+                
+                # Получаем баланс до докупки
+                balance_before = get_coin_balance(crypto)
+                
+                # ШАГ 1: Открываем фьючерс
+                logger.info(f"[{crypto}] 📍 ШАГ 1/2: Докупка ФЬЮЧЕРС...")
+                futures_result = OrderExecutor.place_futures_order(
+                    crypto, "Sell", futures_bid, actual_trade_amount
+                )
+                
+                if not futures_result["success"]:
+                    logger.error(f"[{crypto}] ❌ Ошибка докупки фьючерс: {futures_result['error']}")
+                    continue
+                
+                logger.info(f"[{crypto}] ✅ Фьючерс докуплен: OrderID {futures_result['order_id']}")
+                
+                # ШАГ 2: Открываем спот
+                logger.info(f"[{crypto}] 📍 ШАГ 2/2: Докупка СПОТ...")
+                spot_result = OrderExecutor.place_spot_order(crypto, "Buy", actual_trade_amount)
+                
+                if not spot_result["success"]:
+                    logger.critical(f"[{crypto}] ⚠️ КРИТИЧНО: Фьючерс докуплен, но спот НЕ докуплен!")
+                    logger.critical(f"[{crypto}] Ошибка спота: {spot_result['error']}")
+                    logger.critical(f"[{crypto}] Необходимо вручную закрыть {futures_result['qty']} {crypto}!")
+                    continue
+                
+                logger.info(f"[{crypto}] ✅ Спот докуплен: OrderID {spot_result['order_id']}")
+                
+                # Рассчитываем купленное количество
+                balance_after = get_coin_balance(crypto)
+                purchased_spot_qty = balance_after - balance_before
+                purchased_futures_qty = futures_result['qty']
+                
+                # Обновляем позицию через новый метод add_to_position()
+                success = position_manager.add_to_position(
+                    crypto=crypto,
+                    new_spot_price=spot_ask,
+                    new_futures_price=futures_bid,
+                    new_spot_qty=purchased_spot_qty,
+                    new_futures_qty=purchased_futures_qty,
+                    new_spread_pct=current_spread
+                )
+                
+                if success:
+                    logger.info(f"[{crypto}] ✅ Докупка #{total_entries} успешно обработана")
+                    logger.info(f"[{crypto}] Cooldown на следующие {ADDITIONAL_BUY_COOLDOWN_MINUTES} минут")
+                else:
+                    logger.error(f"[{crypto}] ❌ Ошибка обновления позиции после докупки")
+                
+                # Продолжаем мониторинг для следующей докупки
+                
+        logger.info(f"[{crypto}] Завершен мониторинг докупок (достигнут лимит попыток)")
     
     @staticmethod
     def monitor_and_execute(crypto: str, initial_data: dict, position_manager) -> bool:
