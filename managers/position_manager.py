@@ -265,6 +265,107 @@ class MultiPositionManager:
                 logger.error(f"Ошибка обновления количества {crypto}: {e}")
                 return False
     
+    def add_to_position(
+        self,
+        crypto: str,
+        new_spot_price: float,
+        new_futures_price: float,
+        new_spot_qty: float,
+        new_futures_qty: float,
+        new_spread_pct: float
+    ) -> bool:
+        """
+        Докупка к существующей позиции с усреднением цен.
+        
+        Формула усреднения:
+        average_price = (old_price * old_qty + new_price * new_qty) / (old_qty + new_qty)
+        
+        Args:
+            crypto: Символ криптовалюты
+            new_spot_price: Цена докупки спот
+            new_futures_price: Цена докупки фьючерс
+            new_spot_qty: Количество докупки спот
+            new_futures_qty: Количество докупки фьючерс
+            new_spread_pct: Спред при докупке
+            
+        Returns:
+            bool: True если докупка успешна
+        """
+        with self.lock:
+            try:
+                from datetime import datetime
+                
+                # Получаем текущую позицию
+                position = self.position_repo.get_by_crypto(crypto)
+                if not position:
+                    logger.error(f"[{crypto}] Позиция не найдена для докупки")
+                    return False
+                
+                # Сохраняем старые значения
+                old_spot_qty = position.spot_qty
+                old_futures_qty = position.futures_qty
+                old_avg_spot_price = position.average_spot_entry_price
+                old_avg_futures_price = position.average_futures_entry_price
+                
+                # Рассчитываем новые усредненные цены
+                total_spot_qty = old_spot_qty + new_spot_qty
+                total_futures_qty = old_futures_qty + new_futures_qty
+                
+                new_avg_spot_price = (
+                    (old_avg_spot_price * old_spot_qty + new_spot_price * new_spot_qty) / 
+                    total_spot_qty
+                )
+                
+                new_avg_futures_price = (
+                    (old_avg_futures_price * old_futures_qty + new_futures_price * new_futures_qty) / 
+                    total_futures_qty
+                )
+                
+                # Обновляем позицию в БД
+                position.spot_qty = total_spot_qty
+                position.futures_qty = total_futures_qty
+                position.average_spot_entry_price = new_avg_spot_price
+                position.average_futures_entry_price = new_avg_futures_price
+                position.last_entry_spread_pct = new_spread_pct
+                position.total_entries += 1
+                position.last_addition_timestamp = datetime.now()
+                position.updated_at = datetime.now()
+                
+                # Сохраняем изменения
+                self.position_repo.save(position)
+                
+                # Логирование
+                logger.info("=" * 70)
+                logger.info(f"📈 ДОКУПКА ПОЗИЦИИ: {crypto} (вход #{position.total_entries})")
+                logger.info("=" * 70)
+                logger.info(f"📊 УСРЕДНЕНИЕ ЦЕН:")
+                logger.info(
+                    f"  Спот: {old_avg_spot_price:.6f} → {new_avg_spot_price:.6f} "
+                    f"(новая: {new_spot_price:.6f})"
+                )
+                logger.info(
+                    f"  Фьючерс: {old_avg_futures_price:.6f} → {new_avg_futures_price:.6f} "
+                    f"(новая: {new_futures_price:.6f})"
+                )
+                logger.info(f"")
+                logger.info(f"📦 КОЛИЧЕСТВО:")
+                logger.info(
+                    f"  Спот: {old_spot_qty:.4f} + {new_spot_qty:.4f} = {total_spot_qty:.4f}"
+                )
+                logger.info(
+                    f"  Фьючерс: {old_futures_qty:.4f} + {new_futures_qty:.4f} = {total_futures_qty:.4f}"
+                )
+                logger.info(f"")
+                logger.info(f"📈 СПРЕД: {new_spread_pct:.4f}%")
+                logger.info(f"🔢 Всего входов: {position.total_entries}")
+                logger.info("=" * 70)
+                
+                return True
+                
+            except Exception as e:
+                logger.error(f"[{crypto}] Ошибка докупки позиции: {e}", exc_info=True)
+                return False
+    
     def add_additional_buy(self, crypto: str, spread_level: float) -> bool:
         """
         Добавляет уровень докупки.
