@@ -91,6 +91,7 @@ class TelegramBot:
         application.add_handler(CommandHandler("status", self.handlers.status))
         application.add_handler(CommandHandler("positions", self.handlers.positions))
         application.add_handler(CommandHandler("stats", self.handlers.stats))
+        application.add_handler(CommandHandler("history", self.handlers.history))
         application.add_handler(CommandHandler("blacklist", self.handlers.blacklist))
 
         # Регистрация обработчика ошибок
