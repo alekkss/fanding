@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+
 """
 SQLAlchemy модели для арбитражного бота.
 Определяет структуру таблиц: positions, closed_positions, blacklist.
@@ -7,7 +8,7 @@ SQLAlchemy модели для арбитражного бота.
 from datetime import datetime
 from typing import Optional
 from sqlalchemy import (
-    Column, Integer, String, Float, Boolean, 
+    Column, Integer, String, Float, Boolean,
     DateTime, Text, Index
 )
 from database.database import Base
@@ -16,49 +17,61 @@ from database.database import Base
 class Position(Base):
     """
     Модель открытой арбитражной позиции.
-    
-    Соответствует структуре из JSON файлов positions/*.json
+    Поддерживает множественные входы (докупки) с усреднением цен.
     """
     __tablename__ = "positions"
-    
+
     # Первичный ключ
     id = Column(Integer, primary_key=True, autoincrement=True)
-    
+
     # Криптовалюта (уникальная - одна позиция на символ)
     crypto = Column(String(20), unique=True, nullable=False, index=True)
-    
-    # Цены входа
+
+    # Цены первого входа (сохраняем для истории)
     spot_entry_price = Column(Float, nullable=False)
     futures_entry_price = Column(Float, nullable=False)
-    
-    # Количество монет
+
+    # 🆕 Усредненные цены входа (используются для расчета PnL)
+    average_spot_entry_price = Column(Float, nullable=False)
+    average_futures_entry_price = Column(Float, nullable=False)
+
+    # Количество монет (обновляется при докупках)
     spot_qty = Column(Float, nullable=False)
     futures_qty = Column(Float, nullable=False)
-    
-    # Спред при входе
+
+    # Спред при первом входе
     entry_spread_pct = Column(Float, nullable=False)
-    
+
+    # 🆕 Спред последней докупки (для расчета следующей докупки)
+    last_entry_spread_pct = Column(Float, nullable=False)
+
+    # 🆕 Количество входов (1 = начальный вход, 2+ = с докупками)
+    total_entries = Column(Integer, default=1, nullable=False)
+
     # Временные метки
     entry_timestamp = Column(DateTime, nullable=False)
     last_funding_check_time = Column(DateTime, nullable=True)
-    
+
+    # 🆕 Время последней докупки (для cooldown)
+    last_addition_timestamp = Column(DateTime, nullable=True)
+
     # Отслеживание funding rate
     funding_payments_count = Column(Integer, default=0, nullable=False)
     low_fr_count = Column(Integer, default=0, nullable=False)
     consecutive_low_fr = Column(Boolean, default=False, nullable=False)
-    
+
     # Метаданные
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
-    
+
     def __repr__(self) -> str:
         return (
-            f"<Position(crypto={self.crypto}, "
-            f"spot_entry={self.spot_entry_price:.6f}, "
-            f"futures_entry={self.futures_entry_price:.6f}, "
-            f"qty={self.spot_qty:.4f})>"
+            f"<Position(crypto='{self.crypto}', "
+            f"entries={self.total_entries}, "
+            f"avg_spot={self.average_spot_entry_price:.6f}, "
+            f"avg_futures={self.average_futures_entry_price:.6f})>"
         )
-    
+
     def to_dict(self) -> dict:
         """
         Преобразует модель в словарь (совместимость с JSON форматом).
@@ -70,14 +83,22 @@ class Position(Base):
             "crypto": self.crypto,
             "spot_entry_price": self.spot_entry_price,
             "futures_entry_price": self.futures_entry_price,
+            "average_spot_entry_price": self.average_spot_entry_price,  # 🆕
+            "average_futures_entry_price": self.average_futures_entry_price,  # 🆕
             "spot_qty": self.spot_qty,
             "futures_qty": self.futures_qty,
             "entry_spread_pct": self.entry_spread_pct,
+            "last_entry_spread_pct": self.last_entry_spread_pct,  # 🆕
+            "total_entries": self.total_entries,  # 🆕
             "entry_timestamp": self.entry_timestamp.isoformat(),
             "funding_payments_count": self.funding_payments_count,
             "last_funding_check_time": (
-                self.last_funding_check_time.isoformat() 
+                self.last_funding_check_time.isoformat()
                 if self.last_funding_check_time else None
+            ),
+            "last_addition_timestamp": (  # 🆕
+                self.last_addition_timestamp.isoformat()
+                if self.last_addition_timestamp else None
             ),
             "low_fr_count": self.low_fr_count,
             "consecutive_low_fr": self.consecutive_low_fr,
@@ -87,37 +108,36 @@ class Position(Base):
 class ClosedPosition(Base):
     """
     Модель закрытой позиции с расчетом PnL.
-    
     Соответствует структуре из closed_positions_history.json
     """
     __tablename__ = "closed_positions"
-    
+
     # Первичный ключ
     id = Column(Integer, primary_key=True, autoincrement=True)
-    
+
     # Криптовалюта
     crypto = Column(String(20), nullable=False, index=True)
-    
+
     # Временные метки
     entry_timestamp = Column(DateTime, nullable=False)
     close_timestamp = Column(DateTime, nullable=False)
-    
+
     # Цены входа
     spot_entry_price = Column(Float, nullable=False)
     futures_entry_price = Column(Float, nullable=False)
-    
+
     # Цены выхода
     spot_exit_price = Column(Float, nullable=False)
     futures_exit_price = Column(Float, nullable=False)
-    
+
     # Количество монет
     spot_qty = Column(Float, nullable=False)
     futures_qty = Column(Float, nullable=False)
-    
+
     # Спреды
     entry_spread_pct = Column(Float, nullable=False)
     close_spread_pct = Column(Float, nullable=False)
-    
+
     # PnL компоненты
     net_pnl = Column(Float, nullable=False)  # Чистая прибыль/убыток
     price_pnl = Column(Float, nullable=False)  # PnL от изменения цены
@@ -125,20 +145,19 @@ class ClosedPosition(Base):
     futures_pnl = Column(Float, nullable=True)  # PnL фьючерс позиции
     funding_pnl = Column(Float, nullable=False)  # Полученный фандинг
     commission = Column(Float, nullable=False)  # Комиссии
-    
+
     # Дополнительная информация
     funding_payments_count = Column(Integer, default=0, nullable=False)
-    
+
     # Метаданные
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    
+
     def __repr__(self) -> str:
         return (
-            f"<ClosedPosition(crypto={self.crypto}, "
-            f"net_pnl={self.net_pnl:.4f} USDT, "
-            f"closed_at={self.close_timestamp})>"
+            f"<ClosedPosition(crypto='{self.crypto}', "
+            f"net_pnl={self.net_pnl:.4f})>"
         )
-    
+
     def to_dict(self) -> dict:
         """
         Преобразует модель в словарь.
@@ -173,36 +192,34 @@ class ClosedPosition(Base):
 class Blacklist(Base):
     """
     Модель для исключенных криптовалют.
-    
     Соответствует структуре из blacklist.json
     """
     __tablename__ = "blacklist"
-    
+
     # Первичный ключ
     id = Column(Integer, primary_key=True, autoincrement=True)
-    
+
     # Криптовалюта (уникальная)
     crypto = Column(String(20), unique=True, nullable=False, index=True)
-    
+
     # Причина добавления в blacklist
     reason = Column(Text, nullable=False)
-    
+
     # Код ошибки (если есть)
     error_code = Column(Integer, nullable=True)
-    
+
     # Временная метка добавления
     timestamp = Column(DateTime, nullable=False)
-    
+
     # Метаданные
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    
+
     def __repr__(self) -> str:
         return (
-            f"<Blacklist(crypto={self.crypto}, "
-            f"reason={self.reason[:50]}..., "
-            f"error_code={self.error_code})>"
+            f"<Blacklist(crypto='{self.crypto}', "
+            f"reason='{self.reason[:30]}...')>"
         )
-    
+
     def to_dict(self) -> dict:
         """
         Преобразует модель в словарь (совместимость с JSON форматом).
