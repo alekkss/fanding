@@ -315,8 +315,28 @@ _Детали:_ {message_text}
             
             lines.append(f"{idx}. {crypto}")
             lines.append(f"├─ Вход: {time_str} ({duration_str} назад)")
-            lines.append(f"├─ Спот: {spot_price:.6f} USDT (qty: {spot_qty:.4f})")
-            lines.append(f"├─ Фьючерс: {futures_price:.6f} USDT (qty: {futures_qty:.4f})")
+                    
+            # 🆕 Показываем информацию о докупках
+            total_entries = pos.get('total_entries', 1)
+            if total_entries > 1:
+                lines.append(f"├─ 🔢 Входов: {total_entries}")
+                # Показываем усредненные цены если есть
+                avg_spot = pos.get('average_spot_entry_price')
+                avg_futures = pos.get('average_futures_entry_price')
+                if avg_spot and avg_futures:
+                    lines.append(f"├─ 📊 Усредненные цены:")
+                    lines.append(f"│  ├─ Спот: {avg_spot:.6f} USDT")
+                    lines.append(f"│  └─ Фьюч: {avg_futures:.6f} USDT")
+                    lines.append(f"├─ Спот qty: {spot_qty:.4f}")
+                    lines.append(f"├─ Фьючерс qty: {futures_qty:.4f}")
+                else:
+                    lines.append(f"├─ Спот: {spot_price:.6f} USDT (qty: {spot_qty:.4f})")
+                    lines.append(f"├─ Фьючерс: {futures_price:.6f} USDT (qty: {futures_qty:.4f})")
+            else:
+                # Обычная позиция без докупок
+                lines.append(f"├─ Спот: {spot_price:.6f} USDT (qty: {spot_qty:.4f})")
+                lines.append(f"├─ Фьючерс: {futures_price:.6f} USDT (qty: {futures_qty:.4f})")
+                    
             lines.append(f"└─ Спред: {spread:.2f}%")
             
             # Добавляем пустую строку между позициями (кроме последней)

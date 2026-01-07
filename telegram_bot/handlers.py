@@ -282,6 +282,16 @@ class CommandHandlers:
                 # Форматирование сделки
                 entry_text = f"{idx}. {pnl_emoji} *{pos.crypto}*\n"
                 entry_text += f"├─ ⏰ {close_time} ({duration_str})\n"
+
+                # 🆕 Показываем количество входов если была докупка
+                if hasattr(pos, 'total_entries') and pos.total_entries > 1:
+                    entry_text += f"├─ 🔢 Входов: {pos.total_entries}\n"
+                    # Показываем первоначальные и усредненные цены
+                    if hasattr(pos, 'average_spot_entry_price') and hasattr(pos, 'average_futures_entry_price'):
+                        entry_text += f"├─ 📊 Усредн. цены:\n"
+                        entry_text += f"│  ├─ Спот: `{pos.spot_entry_price:.6f}` → `{pos.average_spot_entry_price:.6f}`\n"
+                        entry_text += f"│  └─ Фьюч: `{pos.futures_entry_price:.6f}` → `{pos.average_futures_entry_price:.6f}`\n"
+
                 entry_text += f"├─ 📈 Спот PnL: `{pos.spot_pnl:+.4f}` USDT\n" if pos.spot_pnl else ""
                 entry_text += f"├─ 📉 Фьючерс PnL: `{pos.futures_pnl:+.4f}` USDT\n" if pos.futures_pnl else ""
                 entry_text += f"├─ 💰 Funding: `{pos.funding_pnl:+.4f}` USDT\n"
@@ -320,6 +330,11 @@ class CommandHandlers:
 
                     entry_text = f"{idx}. {pnl_emoji} *{pos.crypto}*\n"
                     entry_text += f"├─ ⏰ {close_time} ({duration_str})\n"
+
+                    # 🆕 Показываем количество входов если была докупка
+                    if hasattr(pos, 'total_entries') and pos.total_entries > 1:
+                        entry_text += f"├─ 🔢 Входов: {pos.total_entries}\n"
+
                     entry_text += f"├─ 📈 Спот: `{pos.spot_pnl:+.4f}` USDT\n" if pos.spot_pnl else ""
                     entry_text += f"├─ 📉 Фьючерс: `{pos.futures_pnl:+.4f}` USDT\n" if pos.futures_pnl else ""
                     entry_text += f"├─ 💰 FR: `{pos.funding_pnl:+.4f}` USDT\n"
