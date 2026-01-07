@@ -458,9 +458,9 @@ class MultiPositionManager:
                 
                 # 3. Расчет PnL
                 pnl_result = PnLCalculator.calculate_pnl(
-                    spot_entry_price=position.spot_entry_price,
+                    spot_entry_price=position.average_spot_entry_price,
                     spot_exit_price=close_spot_price,
-                    futures_entry_price=position.futures_entry_price,
+                    futures_entry_price=position.average_futures_entry_price,
                     futures_exit_price=close_futures_price,
                     spot_qty=position.spot_qty,
                     futures_qty=position.futures_qty,
@@ -498,14 +498,22 @@ class MultiPositionManager:
                 logger.info("=" * 70)
                 logger.info(f"💰 ЗАКРЫТА ПОЗИЦИЯ: {crypto}")
                 logger.info("=" * 70)
+
+                # 🆕 Показываем количество входов если была докупка
+                if position.total_entries > 1:
+                    logger.info(f"🔢 КОЛИЧЕСТВО ВХОДОВ: {position.total_entries}")
+                    logger.info(f"  Первый вход: Спот {position.spot_entry_price:.6f}, Фьючерс {position.futures_entry_price:.6f}")
+                    logger.info(f"  Усредненная: Спот {position.average_spot_entry_price:.6f}, Фьючерс {position.average_futures_entry_price:.6f}")
+                    logger.info(f"")
+
                 logger.info(f"📊 ЦЕНЫ:")
                 logger.info(
-                    f"   Спот: {position.spot_entry_price:.6f} → {close_spot_price:.6f} "
-                    f"({((close_spot_price/position.spot_entry_price-1)*100):+.2f}%)"
+                    f"  Спот: {position.average_spot_entry_price:.6f} → {close_spot_price:.6f} "
+                    f"({((close_spot_price/position.average_spot_entry_price-1)*100):+.2f}%)"
                 )
                 logger.info(
-                    f"   Фьючерс: {position.futures_entry_price:.6f} → {close_futures_price:.6f} "
-                    f"({((close_futures_price/position.futures_entry_price-1)*100):+.2f}%)"
+                    f"  Фьючерс: {position.average_futures_entry_price:.6f} → {close_futures_price:.6f} "
+                    f"({((close_futures_price/position.average_futures_entry_price-1)*100):+.2f}%)"
                 )
                 logger.info(f"")
                 logger.info(f"📈 СПРЕД:")
