@@ -53,8 +53,8 @@ class OpportunityMonitor:
         logger.info(f"[{crypto}] ⏸️ Пауза 10 секунд после открытия позиции...")
         time.sleep(10)
         # 🆕 Запускаем параллельный мониторинг докупок в отдельном потоке
-        from config import ENABLE_ADDITIONAL_BUYS
-        if ENABLE_ADDITIONAL_BUYS:
+        from config import ENABLE_POSITION_ADDITIONS
+        if ENABLE_POSITION_ADDITIONS:
             import threading
             additional_buy_thread = threading.Thread(
                 target=OpportunityMonitor.monitor_additional_buys,
@@ -223,13 +223,13 @@ class OpportunityMonitor:
             position_manager: Менеджер позиций
         """
         from config import (
-            ADDITIONAL_BUY_SPREAD_INCREMENT,
-            ADDITIONAL_BUY_COOLDOWN_MINUTES,
-            MAX_ADDITIONAL_BUYS
+            ADDITION_SPREAD_INCREMENT,
+            ADDITION_COOLDOWN_SEC,
+            MAX_POSITION_ADDITIONS
         )
         from datetime import datetime, timedelta
         
-        logger.info(f"[{crypto}] 🔄 Запущен мониторинг докупок (макс. {MAX_ADDITIONAL_BUYS} докупок)")
+        logger.info(f"[{crypto}] 🔄 Запущен мониторинг докупок (макс. {MAX_POSITION_ADDITIONS} докупок)")
         
         max_monitoring_attempts = 500  # ~41 час при интервале 300 сек
         attempts = 0
@@ -247,15 +247,15 @@ class OpportunityMonitor:
             total_entries = position.get('total_entries', 1)
             
             # Проверка максимального количества докупок
-            if total_entries > MAX_ADDITIONAL_BUYS:
-                logger.info(f"[{crypto}] Достигнут лимит докупок ({MAX_ADDITIONAL_BUYS}), завершаем мониторинг")
+            if total_entries > MAX_POSITION_ADDITIONS:
+                logger.info(f"[{crypto}] Достигнут лимит докупок ({MAX_POSITION_ADDITIONS}), завершаем мониторинг")
                 return
             
             # Проверяем cooldown с последней докупки
             last_addition_timestamp = position.get('last_addition_timestamp')
             if last_addition_timestamp:
                 time_since_last = datetime.now() - last_addition_timestamp
-                cooldown_remaining = timedelta(minutes=ADDITIONAL_BUY_COOLDOWN_MINUTES) - time_since_last
+                cooldown_remaining = timedelta(seconds=ADDITION_COOLDOWN_SEC) - time_since_last
                 
                 if cooldown_remaining.total_seconds() > 0:
                     minutes_remaining = int(cooldown_remaining.total_seconds() / 60)
@@ -287,12 +287,12 @@ class OpportunityMonitor:
             last_entry_spread = position.get('last_entry_spread_pct', position.get('entry_spread_pct'))
             
             # Рассчитываем целевой спред для следующей докупки
-            target_spread = last_entry_spread + ADDITIONAL_BUY_SPREAD_INCREMENT
+            target_spread = last_entry_spread + ADDITION_SPREAD_INCREMENT
             
             logger.debug(
                 f"[{crypto}] [Попытка {attempts}] Вход #{total_entries}: "
                 f"Текущий спред {current_spread:.4f}%, "
-                f"Целевой {target_spread:.4f}% (+{ADDITIONAL_BUY_SPREAD_INCREMENT:.2f}%)"
+                f"Целевой {target_spread:.4f}% (+{ADDITION_SPREAD_INCREMENT:.2f}%)"
             )
             
             # Проверяем условие докупки
@@ -353,7 +353,7 @@ class OpportunityMonitor:
                 
                 if success:
                     logger.info(f"[{crypto}] ✅ Докупка #{total_entries} успешно обработана")
-                    logger.info(f"[{crypto}] Cooldown на следующие {ADDITIONAL_BUY_COOLDOWN_MINUTES} минут")
+                    logger.info(f"[{crypto}] Cooldown на следующие {ADDITION_COOLDOWN_SEC} секунд")
                 else:
                     logger.error(f"[{crypto}] ❌ Ошибка обновления позиции после докупки")
                 
