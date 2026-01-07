@@ -97,7 +97,7 @@ class TelegramBot:
         # Регистрация обработчика ошибок
         application.add_error_handler(self.handlers.error_handler)
 
-        logger.info("✅ Handlers зарегистрированы: /start, /status, /positions, /stats, /blacklist")
+        logger.info("✅ Handlers зарегистрированы: /start, /status, /positions, /stats, /history, /blacklist")
 
         return application
 
