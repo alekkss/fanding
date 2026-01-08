@@ -7,6 +7,7 @@ Singleton с thread-safe отправкой и retry механизмом.
 import logging
 import threading
 import time
+import asyncio
 from typing import Dict, Any, Optional
 from queue import Queue
 
@@ -124,15 +125,15 @@ class NotificationService:
         
         for attempt in range(1, self.config.MAX_RETRY_ATTEMPTS + 1):
             try:
-                self.bot.send_message(
+                # 🆕 Синхронный вызов async функции через asyncio.run()
+                asyncio.run(self.bot.send_message(
                     chat_id=chat_id,
                     text=text,
                     parse_mode=self.config.PARSE_MODE,
                     disable_web_page_preview=self.config.DISABLE_WEB_PAGE_PREVIEW,
                     read_timeout=self.config.MESSAGE_TIMEOUT,
                     write_timeout=self.config.MESSAGE_TIMEOUT
-                )
-                
+                ))
                 logger.debug(f"✅ Сообщение отправлено в chat_id={chat_id}")
                 return True
                 

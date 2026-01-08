@@ -107,7 +107,13 @@ class PositionRepository(BaseRepository[Position]):
         spot_qty: float,
         futures_qty: float,
         entry_spread_pct: float,
-        entry_timestamp: Optional[datetime] = None
+        entry_timestamp: Optional[datetime] = None,
+        # 🆕 Параметры для системы докупок
+        total_entries: int = 1,
+        average_spot_entry_price: Optional[float] = None,
+        average_futures_entry_price: Optional[float] = None,
+        last_addition_timestamp: Optional[datetime] = None,
+        last_entry_spread_pct: Optional[float] = None
     ) -> Optional[Position]:
         """
         Создать новую позицию.
@@ -141,7 +147,13 @@ class PositionRepository(BaseRepository[Position]):
                 funding_payments_count=0,
                 low_fr_count=0,
                 consecutive_low_fr=False,
-                last_funding_check_time=None
+                last_funding_check_time=None,
+                # 🆕 Поля для системы докупок
+                total_entries=total_entries,
+                average_spot_entry_price=average_spot_entry_price,
+                average_futures_entry_price=average_futures_entry_price,
+                last_addition_timestamp=last_addition_timestamp,
+                last_entry_spread_pct=last_entry_spread_pct
             )
             
             saved_position = self.save(position)
