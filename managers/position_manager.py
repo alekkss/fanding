@@ -94,9 +94,13 @@ class MultiPositionManager:
                         crypto=crypto,
                         spot_entry_price=spot_price,
                         futures_entry_price=futures_price,
+                        average_spot_entry_price=spot_price,        # ← ДОБАВЬ
+                        average_futures_entry_price=futures_price,  # ← ДОБАВЬ
                         spot_qty=spot_qty,
                         futures_qty=futures_qty,
-                        entry_spread_pct=spread_pct
+                        entry_spread_pct=spread_pct,
+                        last_entry_spread_pct=spread_pct,           # ← ДОБАВЬ
+                        total_entries=1                              # ← ДОБАВЬ
                     )
                     
                     if not position:

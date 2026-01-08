@@ -32,8 +32,8 @@ class Position(Base):
     futures_entry_price = Column(Float, nullable=False)
 
     # 🆕 Усредненные цены входа (используются для расчета PnL)
-    average_spot_entry_price = Column(Float, nullable=False)
-    average_futures_entry_price = Column(Float, nullable=False)
+    average_spot_entry_price = Column(Float, nullable=True)      # ← ИСПРАВЛЕНО
+    average_futures_entry_price = Column(Float, nullable=True)
 
     # Количество монет (обновляется при докупках)
     spot_qty = Column(Float, nullable=False)

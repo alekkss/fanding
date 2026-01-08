@@ -109,26 +109,9 @@ class OpportunityMonitor:
             # Мы продаем спот (bid) и покупаем фьюч (ask) для закрытия
             current_close_spread = (fut_ask - spot_bid) / spot_bid * 100
 
-            # 🆕 Рассчитываем спред для ДОКУПКИ (открытия)
-            spot_ask = spot_ob.get('ask')
-            futures_bid = fut_ob.get('bid')
-
-            if spot_ask and futures_bid:
-                # Спред для докупки: (futures_bid - spot_ask) / spot_ask
-                current_addition_spread = (futures_bid - spot_ask) / spot_ask * 100
-                
-                # Получаем целевой спред для следующей докупки
-                from config import ADDITION_SPREAD_INCREMENT
-                last_entry_spread = current_position.get('last_entry_spread_pct', 
-                                                        current_position.get('entry_spread_pct', 0))
-                target_addition_spread = last_entry_spread + ADDITION_SPREAD_INCREMENT
-                
-                addition_spread_info = f", Спред докупки: текущий {current_addition_spread:.4f}% / нужно {target_addition_spread:.4f}%"
-            else:
-                addition_spread_info = ""
-
+            # Логируем только FR и спред закрытия (спред докупки логирует отдельный поток)
             logger.info(f"[{crypto}] [{attempts}/{max_attempts}] FR: {funding_rate:.4f}%, "
-                        f"Спред закрытия: {current_close_spread:.4f}%{addition_spread_info}")
+                        f"Спред закрытия: {current_close_spread:.4f}%")
 
             # Проверяем мягкий режим
             soft_mode_active = current_position.get('consecutive_low_fr', False)
