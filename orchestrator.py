@@ -140,6 +140,10 @@ class MultiCryptoOrchestrator:
             if success:
                 logger.info(f"[{crypto}] ✅ Позиция успешно открыта")
                 
+                # Добавляем в активные потоки ДО запуска мониторинга
+                with self.lock:
+                    self.active_threads.add(crypto)
+                
                 # Запускаем поток мониторинга
                 monitor_thread = threading.Thread(
                     target=self.monitor_position,
@@ -148,7 +152,6 @@ class MultiCryptoOrchestrator:
                     daemon=True
                 )
                 monitor_thread.start()
-                
                 return True
             else:
                 logger.warning(f"[{crypto}] ⚠️ Не удалось открыть позицию")
@@ -212,12 +215,23 @@ class MultiCryptoOrchestrator:
         try:
             open_positions = self.position_manager.get_open_cryptos()
             open_count = len(open_positions)
-            logger.info(f"📊 Открытых позиций: {open_count}/{MAX_CONCURRENT_POSITIONS}")
-            
-            if open_count >= MAX_CONCURRENT_POSITIONS:
+
+            # Считаем активные потоки мониторинга условий (префикс "open_")
+            with self.lock:
+                monitoring_count = len([t for t in self.active_threads if t.startswith("open_")])
+
+            total_active = open_count + monitoring_count
+
+            logger.info(
+                f"📊 Открытых позиций: {open_count}/{MAX_CONCURRENT_POSITIONS}, "
+                f"Мониторингов условий: {monitoring_count}, "
+                f"Всего активных: {total_active}"
+            )
+
+            if total_active >= MAX_CONCURRENT_POSITIONS:
                 logger.info(
-                    f"⏸️ Достигнут лимит позиций ({MAX_CONCURRENT_POSITIONS}), "
-                    f"ждем закрытия"
+                    f"⏸️ Достигнут лимит активных операций ({MAX_CONCURRENT_POSITIONS}), "
+                    f"ждем завершения"
                 )
                 return
             
@@ -265,9 +279,10 @@ class MultiCryptoOrchestrator:
             funding_rates = FundingRateFetcher.get_batch_funding_rates(crypto_list)
             
             # Находим возможности
+            available_slots = MAX_CONCURRENT_POSITIONS - total_active
             opportunities = ArbitrageCalculator.find_top_opportunities(
                 filtered_pairs, funding_rates,
-                limit=MAX_CONCURRENT_POSITIONS - open_count
+                limit=max(1, available_slots)  # Минимум 1, чтобы не было ошибок
             )
             
             if not opportunities:
@@ -293,6 +308,13 @@ class MultiCryptoOrchestrator:
                     if f"open_{crypto}" in self.active_threads:
                         logger.warning(
                             f"[{crypto}] ⚠️ Уже запущен поток открытия, пропускаем"
+                        )
+                        continue
+                    
+                    # Проверяем активные потоки мониторинга
+                    if crypto in self.active_threads:
+                        logger.warning(
+                            f"[{crypto}] ⚠️ Уже запущен мониторинг, пропускаем"
                         )
                         continue
                     
